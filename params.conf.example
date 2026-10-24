@@ -1,0 +1,51 @@
+# Copy this file outside the repository, fill it, and pass that copy to install.sh.
+# Never commit the filled file. The installer does not read this example.
+#
+# How to obtain each value: docs/prepare.md
+# Do not put an account password, a Mullvad account number, or a card number here.
+
+# --- Hot wallets. Generate new ones. Do not reuse a wallet that holds other funds. ---
+WALLET_MNEMONIC = ""
+WALLET_PASSPHRASE = ""
+SOLANA_KEYPAIR = ""
+WECX_MINT_ADDRESS = "EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq"
+
+# --- Owner sweeps. Customer payouts stay immediate. ---
+OWNER_ECX_ADDRESS = ""
+OWNER_SOL_ADDRESS = ""
+EARNINGS_THRESHOLD_ECX = "100"
+EARNINGS_THRESHOLD_WECX = "100"
+
+# --- Fees. Confirmations default to 3. ---
+PEGIN_FEE_BPS = "100"
+PEGOUT_FEE_BPS = "100"
+PEGIN_FLAT_FEE_SAT = "1000"
+MIN_DEPOSIT_AMOUNT_SAT = "500"
+ECX_DEPOSIT_MIN_CONFS = "3"
+
+# --- Chain endpoints. Leave these unless you run your own. ---
+ECX_ESPLORA_URL = "https://explorer.beta.ecash.ninja/api/"
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+
+# --- Hop 2, required. OVPN Public IPv4 WireGuard file. ---
+VPN_PROVIDER = "ovpn"
+VPN_WG_PRIVATE_KEY = ""
+VPN_WG_ADDRESS = ""
+VPN_WG_DNS = ""
+VPN_WG_PEER_PUBLIC_KEY = ""
+VPN_WG_ENDPOINT = ""
+VPN_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
+VPN_PUBLIC_IPV4 = ""
+
+# --- Hop 1, optional. Leave every HOP1 line empty to use OVPN alone. ---
+HOP1_PROVIDER = ""
+HOP1_WG_PRIVATE_KEY = ""
+HOP1_WG_ADDRESS = ""
+HOP1_WG_DNS = ""
+HOP1_WG_PEER_PUBLIC_KEY = ""
+HOP1_WG_ENDPOINT = ""
+HOP1_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
+
+# --- Cloudflare. The tunnel token is the eyJ string, not the install command. ---
+CLOUDFLARE_TUNNEL_TOKEN = ""
+CLOUDFLARE_HOSTNAME = ""

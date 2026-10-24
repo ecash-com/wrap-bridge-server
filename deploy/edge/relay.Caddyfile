@@ -1,0 +1,19 @@
+# Runs on the relay. cloudflared is the only client. The upstream is the local Tor forwarder,
+# or 10.88.0.2:3001 if the hop is WireGuard instead.
+{
+	admin off
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+http://127.0.0.1:8080 {
+	request_body {
+		max_size 64KB
+	}
+	reverse_proxy 127.0.0.1:3001 {
+		header_up X-Edge-Token {env.EDGE_SHARED_TOKEN}
+		header_up CF-Connecting-IP {http.request.header.CF-Connecting-IP}
+		header_up -X-Forwarded-For
+	}
+}

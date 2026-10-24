@@ -1,0 +1,6 @@
+# Optional. The recommended hop is OVPN WireGuard, not Tor. See README.md.
+# Bridge host. The onion accepts connections from Tor and hands them to the local frontend.
+# It does not open a public port. Do not point this at the backend.
+SocksPort 9050
+HiddenServiceDir /var/lib/tor/ecash-bridge/
+HiddenServicePort 3001 127.0.0.1:3001

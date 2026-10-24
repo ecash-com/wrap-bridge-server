@@ -1,0 +1,2 @@
+# Relay host. Used only to dial the bridge onion. The public site enters through cloudflared.
+SocksPort 9050

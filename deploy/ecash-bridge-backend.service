@@ -1,0 +1,39 @@
+[Unit]
+Description=ECash bridge backend API and order poller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bridgebackend
+Group=bridgebackend
+WorkingDirectory=/opt/ecash-bridge/backend
+EnvironmentFile=/etc/ecash-bridge/backend.env
+Environment=EARNINGS_CONFIG_PATH=/etc/ecash-bridge/earnings.toml
+Environment=DATABASE_PATH=/opt/ecash-bridge/backend/data/bridge.db
+# Optional. Send Esplora and Solana RPC through a local proxy so those providers do not learn this
+# machine's address. Use an HTTP proxy, or a SOCKS proxy only if the binary was built with it.
+# Environment=HTTPS_PROXY=http://127.0.0.1:8118
+# Environment=ALL_PROXY=http://127.0.0.1:8118
+ExecStart=/opt/ecash-bridge/backend/swap-backend serve --addr 127.0.0.1:3000
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/opt/ecash-bridge/backend/data
+
+[Install]
+WantedBy=multi-user.target

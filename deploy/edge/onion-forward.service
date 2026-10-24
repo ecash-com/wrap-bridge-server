@@ -1,0 +1,15 @@
+[Unit]
+Description=Forward the local relay port to the bridge onion
+After=tor.service
+Requires=tor.service
+
+[Service]
+Type=simple
+# Replace the onion hostname with the value printed by the bridge's hidden service.
+ExecStart=/usr/bin/socat TCP-LISTEN:3001,bind=127.0.0.1,reuseaddr,fork SOCKS4A:127.0.0.1:REPLACE.onion:3001,socksport=9050
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

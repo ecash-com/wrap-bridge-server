@@ -1,0 +1,5 @@
+enabled = true
+earnings_threshold_wbecx = "100"
+earnings_threshold_becx = "100"
+solana_owner_address = "9H6cycTDQS8QY9fDP2Zyd9ndmAtikL349TqF8bcjAK9u"
+ecx_owner_address = "bc1qress9jkv0x7z3mc5tev9cnx9wk235kvsq0yur5"

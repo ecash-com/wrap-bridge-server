@@ -1,0 +1,9 @@
+# Relay side. Do not put wallet material on this host.
+[Interface]
+PrivateKey = REPLACE_WITH_RELAY_WIREGUARD_PRIVATE_KEY
+Address = 10.88.0.1/24
+ListenPort = 51820
+
+[Peer]
+PublicKey = REPLACE_WITH_BRIDGE_WIREGUARD_PUBLIC_KEY
+AllowedIPs = 10.88.0.2/32

@@ -1,0 +1,408 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::Result;
+use bdk_wallet::bitcoin::{Amount, FeeRate, Network};
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EarningsConfig {
+    pub enabled: bool,
+    pub earnings_threshold_wbecx: String,
+    pub earnings_threshold_becx: String,
+    pub solana_owner_address: String,
+    pub ecx_owner_address: String,
+}
+
+impl EarningsConfig {
+    pub fn load() -> Result<Option<Self>> {
+        let explicit = std::env::var("EARNINGS_CONFIG_PATH").ok();
+        let path = explicit.as_deref().unwrap_or("earnings.toml");
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if explicit.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(Self::parse(&text)?))
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        let config: Self = toml::from_str(text)?;
+        config.thresholds(8)?;
+        crate::solana::parse_pubkey(&config.solana_owner_address)?;
+        config.ecx_owner_address.parse::<bdk_wallet::bitcoin::Address<_>>()?
+            .require_network(Network::Bitcoin)?;
+        Ok(config)
+    }
+
+    pub fn thresholds(&self, wecx_decimals: u8) -> Result<(u64, u64)> {
+        Ok((
+            coin_amount(&self.earnings_threshold_wbecx, wecx_decimals)?,
+            coin_amount(&self.earnings_threshold_becx, 8)?,
+        ))
+    }
+}
+
+fn coin_amount(text: &str, decimals: u8) -> Result<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    anyhow::ensure!(
+        !whole.is_empty() && whole.bytes().all(|digit| digit.is_ascii_digit())
+            && fraction.bytes().all(|digit| digit.is_ascii_digit())
+            && fraction.len() <= usize::from(decimals),
+        "invalid earnings threshold: expected a positive coin amount"
+    );
+    let scale = 10u64.checked_pow(u32::from(decimals))
+        .ok_or_else(|| anyhow::anyhow!("unsupported token decimals"))?;
+    let units = whole.parse::<u64>()?.checked_mul(scale)
+        .and_then(|units| {
+            let fractional = if fraction.is_empty() { 0 } else { fraction.parse::<u64>().ok()? };
+            units.checked_add(fractional.checked_mul(10u64.checked_pow(u32::from(decimals) - fraction.len() as u32)?)?)
+        })
+        .ok_or_else(|| anyhow::anyhow!("earnings threshold overflow"))?;
+    anyhow::ensure!(units > 0, "earnings threshold must be positive");
+    Ok(units)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Esplora,
+    Electrum,
+}
+
+impl Backend {
+    fn from_env(var: &str, default: Backend) -> Backend {
+        match std::env::var(var).ok().as_deref() {
+            Some("esplora") => Backend::Esplora,
+            Some("electrum") => Backend::Electrum,
+            Some(other) => panic!("{var}: unknown backend {other:?}, expected esplora or electrum"),
+            None => default,
+        }
+    }
+}
+
+pub struct ChainConfig {
+    pub network: Network,
+    pub backend: Backend,
+    pub esplora_url: String,
+    pub electrum_url: String,
+    pub db_path: PathBuf,
+}
+
+impl ChainConfig {
+    /// ECX's betanet network is a shadow fork of real Bitcoin mainnet (confirmed: its genesis
+    /// hash matches mainnet's exactly), so it uses the same `Network::Bitcoin` address/key
+    /// encoding BTC mainnet does - see src/keys.rs.
+    ///
+    /// betanet is the network this repo targets (see CLAUDE.md - drynet4 is an older, different
+    /// network this repo does not use anymore). Both betanet and Bitcoin mainnet are real money
+    /// (see CLAUDE.md) - there is no test network to develop against, so every send here is real.
+    pub fn ecx() -> Self {
+        let data_dir = data_dir();
+        // Public betanet infra has been flaky in the past (address indexer 500s, esplora.* host
+        // down, electrum port not responding - all observed and since recovered at various
+        // points); if it acts up again, override with ECX_BACKEND=electrum (see src/wallet.rs for
+        // both code paths).
+        let backend = Backend::from_env("ECX_BACKEND", Backend::Esplora);
+        // No known-good betanet electrum default to fall back to (unlike the esplora URL below)
+        // - fail loudly instead of guessing a host for a real-money network. Only required (and
+        // only read, see wallet.rs) when the electrum backend is actually selected - computed
+        // from `backend` here rather than as an unconditional struct-field initializer, so
+        // ECX_BACKEND=esplora (the default) never touches ECX_ELECTRUM_URL at all.
+        let electrum_url = match backend {
+            Backend::Electrum => std::env::var("ECX_ELECTRUM_URL").unwrap_or_else(|_| {
+                panic!(
+                    "ECX_BACKEND=electrum but ECX_ELECTRUM_URL is not set - no default betanet \
+                     electrum endpoint is known, set it explicitly"
+                )
+            }),
+            Backend::Esplora => String::new(),
+        };
+        ChainConfig {
+            network: Network::Bitcoin,
+            backend,
+            esplora_url: std::env::var("ECX_ESPLORA_URL")
+                .unwrap_or_else(|_| "https://explorer.beta.ecash.ninja/api".to_string()),
+            electrum_url,
+            db_path: data_dir.join("ecx.db"),
+        }
+    }
+}
+
+fn data_dir() -> PathBuf {
+    let dir = PathBuf::from("data");
+    // Holds the wallet store (which reveals every deposit address and UTXO) - owner-only, not the
+    // default umask's world-readable 0755. Only applies when this call creates the directory; an
+    // existing one keeps whatever mode it already has.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("failed to create data directory");
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).expect("failed to create data directory");
+    dir
+}
+
+/// 1 sat/vB in the sat/kwu units `FeeRate` actually stores (1000 weight units = 250 vbytes).
+/// sat/kwu is finer-grained than whole sat/vB, so a fractional sat/vB rate below 1 (e.g. 0.1,
+/// useful for ECX's betanet where a bare 1 sat/vB can be overkill) still lands on an exact
+/// sat/kwu value instead of getting rounded away by an integer-only parse.
+const SAT_PER_KWU_PER_SAT_PER_VB: f64 = 250.0;
+
+/// Fee rate used for automatic ECX sends (payouts, refunds), from `ECX_PAYOUT_FEE_RATE_SAT_VB`
+/// (default 2 sat/vB, matching the CLI `Send` command's default). Accepts fractional sat/vB (e.g.
+/// `ECX_PAYOUT_FEE_RATE_SAT_VB=0.1`) - missing, unparsable, negative, or non-finite falls back to
+/// the 2 sat/vB default rather than producing a nonsensical rate.
+pub fn ecx_payout_fee_rate() -> FeeRate {
+    let sat_per_vb = std::env::var("ECX_PAYOUT_FEE_RATE_SAT_VB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(2.0);
+    FeeRate::from_sat_per_kwu((sat_per_vb * SAT_PER_KWU_PER_SAT_PER_VB).round() as u64)
+}
+
+/// How often the background poller re-checks not-yet-settled orders for deposit confirmation /
+/// payout, from `ORDER_POLL_INTERVAL_MINUTES` (default 5).
+pub fn order_poll_interval() -> Duration {
+    let minutes = std::env::var("ORDER_POLL_INTERVAL_MINUTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(minutes.max(1) * 60)
+}
+
+/// How long an order can sit without a deposit ever showing up before the poller gives up on it
+/// and marks it `expired`, from `ORDER_MAX_AGE_HOURS` (default 24). Only applies while an order is
+/// still awaiting a deposit (`pending`/`deposit_seen`) - once a deposit is confirmed, the funds
+/// are already in our custody, so the poller keeps retrying the payout regardless of age.
+pub fn order_max_age() -> Duration {
+    let hours = std::env::var("ORDER_MAX_AGE_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(24);
+    Duration::from_secs(hours.max(1) * 3600)
+}
+
+/// Per-request socket timeout for the Esplora HTTP client, from `ESPLORA_TIMEOUT_SECS` (default
+/// 20). With no timeout set, esplora-client leaves reqwest's request timeout unbounded, so a
+/// backend that stops responding mid-connection (rather than cleanly erroring) hangs until the
+/// OS-level TCP timeout gives up. Bounding it here makes that fail fast instead, so
+/// esplora-client's own built-in exponential-backoff retry gets a chance to recover instead of one
+/// hung request stalling the whole sync.
+pub fn esplora_timeout() -> Duration {
+    let secs = std::env::var("ESPLORA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20);
+    Duration::from_secs(secs.max(1))
+}
+
+/// Smallest ECX deposit an order is allowed to move, from `MIN_DEPOSIT_AMOUNT_SAT` (default 500
+/// sat). Below this, either a payout or a refund of it is liable to cost more in tx fees than the
+/// amount itself.
+pub fn min_deposit_amount() -> Amount {
+    let sat = std::env::var("MIN_DEPOSIT_AMOUNT_SAT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(500);
+    Amount::from_sat(sat)
+}
+
+/// Confirmations required on ECX before a detected deposit counts as `deposit_confirmed` rather
+/// than just `deposit_seen`, from `ECX_DEPOSIT_MIN_CONFS` (default 3). Missing or unparsable falls
+/// back to the default rather than failing closed/open in a way that's easy to miss. Clamped to at
+/// least 1: `0` would count an unconfirmed (and freely double-spendable) transaction as a confirmed
+/// deposit and pay out real wECX against it.
+pub fn deposit_min_confs() -> u32 {
+    std::env::var("ECX_DEPOSIT_MIN_CONFS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+fn env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Largest `amount_in_sat` `POST /orders` accepts, from `MAX_DEPOSIT_AMOUNT_SAT` (default 21M ECX,
+/// i.e. the whole supply - a bound against nonsense/overflowing amounts, not a business limit; set
+/// it much lower to cap per-order exposure to treasury liquidity).
+pub fn max_deposit_amount() -> Amount {
+    Amount::from_sat(env_u64("MAX_DEPOSIT_AMOUNT_SAT", 21_000_000 * 100_000_000))
+}
+
+/// Global cap on orders created per rolling minute, from `ORDERS_PER_MINUTE` (default 30). Every
+/// `POST /orders` costs a Solana RPC call, a persisted wallet address, and a DB row that the poller
+/// then re-syncs every tick, and the backend has no auth. This is global rather than per-client
+/// because the backend only ever sees the frontend proxy's address - per-IP limits belong at the
+/// reverse proxy in front of the frontend.
+///
+/// There is no separate daily creation quota. A shared daily budget is itself a denial of service:
+/// filling it locks out every customer, including ones who would have paid. Sustained flooding is
+/// bounded by `max_pending_orders` instead. With the 24-hour order lifetime, that is also the bound
+/// on how many fresh deposit addresses can be revealed per day once the open set is full.
+pub fn max_orders_per_minute() -> u64 {
+    env_u64("ORDERS_PER_MINUTE", 30)
+}
+
+/// How long after an order expires the poller keeps looking for a late deposit, from
+/// `ORDER_EXPIRY_GRACE_HOURS` (default 168). Past this window a late deposit is still refused as
+/// coin-selection input, but it is no longer revived automatically.
+pub fn expiry_grace() -> Duration {
+    Duration::from_secs(env_u64("ORDER_EXPIRY_GRACE_HOURS", 168).max(1) * 3600)
+}
+
+/// Cap on simultaneously `pending` (deposit-awaited) orders, from `MAX_PENDING_ORDERS` (default
+/// 200). Bounds the address set the poller syncs each tick and the wallet-store growth from
+/// unfunded orders.
+pub fn max_pending_orders() -> u64 {
+    env_u64("MAX_PENDING_ORDERS", 200)
+}
+
+/// Minimum spacing between explorer syncs triggered by `GET /orders/{id}`, from
+/// `GET_SYNC_MIN_INTERVAL_SECS` (default 10). A sync holds the global ECX wallet lock for a network
+/// round-trip, so without this anyone with an order id could stall the poller and every
+/// `POST /orders` just by polling their own order. Requests inside the window read what the last
+/// sync (or the background poller) already recorded.
+pub fn get_sync_min_interval() -> Duration {
+    Duration::from_secs(env_u64("GET_SYNC_MIN_INTERVAL_SECS", 10))
+}
+
+/// Lamports the treasury must keep in reserve, from `TREASURY_MIN_SOL_LAMPORTS` (default 20_000_000
+/// = 0.02 SOL, roughly ten new recipient token accounts' rent). Below it, new orders are refused
+/// and payouts are held rather than attempted: paying ATA rent and fees for the last few payouts
+/// only to strand the rest is worse than pausing loudly.
+pub fn treasury_min_sol_lamports() -> u64 {
+    env_u64("TREASURY_MIN_SOL_LAMPORTS", 20_000_000)
+}
+
+/// Whether payouts to off-curve Solana addresses (PDAs - e.g. some multisig vaults) are allowed,
+/// from `ALLOW_OFF_CURVE_RECIPIENTS` (default off). Off by default because a mistyped/mangled
+/// address that still decodes to 32 bytes is overwhelmingly likely to be off-curve, and wECX sent
+/// there is unrecoverable.
+pub fn allow_off_curve_recipients() -> bool {
+    matches!(std::env::var("ALLOW_OFF_CURVE_RECIPIENTS").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Flat fee taken on every ECX->wECX peg-in conversion, in basis points (1/100 of a percent), from
+/// `PEGIN_FEE_BPS` (default 100 = 1%). Unlike the old BTC/ECX swap's AMM curve, this is a flat
+/// deduction: there's no pool to feed, since wECX is paid out from a treasury balance rather than
+/// priced against one.
+pub fn pegin_fee_bps() -> u64 {
+    fee_bps("PEGIN_FEE_BPS", 100)
+}
+
+/// Fixed ECX amount kept on every wrap, from `PEGIN_FLAT_FEE_SAT` (default 1_000 sat, which is
+/// 0.00001000 ECX). This is in addition to `pegin_fee_bps` and does not replace the minimum
+/// deposit. It pays for spending the deposit output later, including a dust output a wallet may
+/// attach to the same address.
+pub fn pegin_flat_fee_sat() -> u64 {
+    env_u64("PEGIN_FLAT_FEE_SAT", 1_000)
+}
+
+/// Flat fee for the wECX->ECX peg-out direction, in basis points, from `PEGOUT_FEE_BPS` (default
+/// 100 = 1%). Values above 10000 are rejected rather than saturating the payout to zero.
+pub fn pegout_fee_bps() -> u64 {
+    fee_bps("PEGOUT_FEE_BPS", 100)
+}
+
+fn fee_bps(var: &str, default: u64) -> u64 {
+    let value = std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default);
+    if value > 10_000 {
+        panic!("{var}={value} is above 10000 bps; refusing to start with a fee that saturates the payout to zero");
+    }
+    value
+}
+
+/// Whether the server is allowed to automatically broadcast live payouts/refunds: the ECX refund
+/// send and the wECX treasury payout on Solana. Both betanet ECX and Solana mainnet-beta are real
+/// money (see CLAUDE.md), so - unlike the old swap's BTC-only mainnet gate - this covers every
+/// automatic outbound send this backend can make, from `ALLOW_LIVE_PAYOUTS` (default off). This is
+/// the unattended-server equivalent of the CLI's `--confirm-live` flag.
+pub fn live_payouts_allowed() -> bool {
+    matches!(std::env::var("ALLOW_LIVE_PAYOUTS").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Solana RPC endpoint, from `SOLANA_RPC_URL` (default the public mainnet-beta RPC, which rate-
+/// limits under real usage - see PLAN.md's open decisions on a production RPC provider).
+pub fn solana_rpc_url() -> String {
+    std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string())
+}
+
+/// Base58-encoded 64-byte secret key (the standard `solana-keygen` format) for the treasury
+/// keypair that custodies wECX and pays its own Solana tx fees/rent. Deliberately separate from
+/// `WALLET_MNEMONIC` (see keys.rs): Solana uses ed25519, ECX/BTC use secp256k1, and keeping them
+/// separate limits blast radius if one key leaks.
+pub fn solana_keypair() -> Result<String> {
+    std::env::var("SOLANA_KEYPAIR")
+        .map_err(|_| anyhow::anyhow!("SOLANA_KEYPAIR env var not set (base58 64-byte secret key)"))
+}
+
+/// The wECX SPL token mint address, from `WECX_MINT_ADDRESS`. This backend never needs mint
+/// authority over it (see PLAN.md) - only a treasury token account holding a balance of it.
+pub fn wecx_mint() -> Result<solana_sdk::pubkey::Pubkey> {
+    let raw = std::env::var("WECX_MINT_ADDRESS")
+        .map_err(|_| anyhow::anyhow!("WECX_MINT_ADDRESS env var not set"))?;
+    raw.trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("WECX_MINT_ADDRESS is not a valid Solana address: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn earnings_thresholds_are_exact_and_positive() {
+        assert_eq!(coin_amount("100", 8).unwrap(), 10_000_000_000);
+        assert_eq!(coin_amount("100.00000001", 8).unwrap(), 10_000_000_001);
+        for invalid in ["0", "-100", "NaN", "1.000000001", "18446744073709551615"] {
+            assert!(coin_amount(invalid, 8).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn earnings_config_accepts_approved_addresses_and_rejects_unknown_keys() {
+        let text = include_str!("../earnings.toml");
+        let settings = EarningsConfig::parse(text).unwrap();
+        assert_eq!(settings.thresholds(8).unwrap(), (10_000_000_000, 10_000_000_000));
+        assert!(EarningsConfig::parse(&format!("{text}\nmisspelled_threshold = 1\n")).is_err());
+        assert!(EarningsConfig::parse(&text.replace("bc1qress9jkv0x7z3mc5tev9cnx9wk235kvsq0yur5", "invalid")).is_err());
+    }
+
+    #[test]
+    fn deposit_min_confs_is_clamped_to_at_least_one() {
+        unsafe {
+            std::env::set_var("ECX_DEPOSIT_MIN_CONFS", "0");
+        }
+        assert_eq!(deposit_min_confs(), 1);
+        unsafe {
+            std::env::remove_var("ECX_DEPOSIT_MIN_CONFS");
+        }
+    }
+
+    #[test]
+    fn live_payouts_allowed_defaults_false() {
+        // SAFETY-relevant default: an unset/misconfigured env must never silently enable
+        // automatic real-money sends.
+        unsafe {
+            std::env::remove_var("ALLOW_LIVE_PAYOUTS");
+        }
+        assert!(!live_payouts_allowed());
+    }
+}

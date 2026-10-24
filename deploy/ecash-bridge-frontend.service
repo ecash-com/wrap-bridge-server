@@ -1,0 +1,38 @@
+[Unit]
+Description=ECash bridge frontend preview
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bridgeweb
+Group=bridgeweb
+WorkingDirectory=/opt/ecash-bridge/frontend
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3001
+Environment=ADDRESS_HEADER=X-Forwarded-For
+# Required in the private-edge layout. A drop-in must set this to the same secret the relay sends.
+# Leave it unset only for a local preview that is not reachable from the network.
+# Environment=EDGE_SHARED_TOKEN=
+ExecStart=/usr/local/bin/node /opt/ecash-bridge/frontend/build/index.js
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadOnlyPaths=/opt/ecash-bridge/frontend /usr/local
+
+[Install]
+WantedBy=multi-user.target

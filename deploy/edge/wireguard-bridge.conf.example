@@ -1,0 +1,10 @@
+# Bridge side. This host dials out. The relay provider sees this host's address.
+[Interface]
+PrivateKey = REPLACE_WITH_BRIDGE_WIREGUARD_PRIVATE_KEY
+Address = 10.88.0.2/24
+
+[Peer]
+PublicKey = REPLACE_WITH_RELAY_WIREGUARD_PUBLIC_KEY
+Endpoint = REPLACE_WITH_RELAY_PUBLIC_IP:51820
+AllowedIPs = 10.88.0.1/32
+PersistentKeepalive = 25
