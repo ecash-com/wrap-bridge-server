@@ -60,11 +60,10 @@ inspection (`address`, `balance`, `utxos`, `sync`), manual sends
   no shared daily quota, because exhausting one would refuse every customer.
 - ECX deposits are not treated as confirmed until `ECX_DEPOSIT_MIN_CONFS`
   (default 3). Do not set this to 0.
-- The example mnemonic and Solana key in `.env.example` are public fixtures.
-  The process refuses to open a wallet if it is given those values, or the
-  secrets that were previously committed in that file. Generate new keys.
-  Anyone who cloned the repo before that replacement should treat the old hot
-  wallet as compromised.
+- `.env.example` has empty key fields. Generate new keys. The process also
+  refuses the public example phrases and the secrets that were committed in an
+  older repository. Anyone who used those values should treat that hot wallet
+  as compromised.
 - This is custodial software: whoever holds `WALLET_MNEMONIC` and
   `SOLANA_KEYPAIR` controls the funds in both wallets. Treat both as you
   would any hot wallet key.
