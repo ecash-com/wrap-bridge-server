@@ -55,9 +55,10 @@ parse_params() {
 			value="${BASH_REMATCH[1]}"
 		fi
 		case "$key" in
-			WALLET_MNEMONIC|WALLET_PASSPHRASE|SOLANA_KEYPAIR|WECX_MINT_ADDRESS|\
+			WALLET_MNEMONIC|WALLET_PASSPHRASE|SOLANA_KEYPAIR|WECX_MINT_ADDRESS|ASSET_TICKER|\
 			OWNER_ECX_ADDRESS|OWNER_SOL_ADDRESS|EARNINGS_THRESHOLD_ECX|EARNINGS_THRESHOLD_WECX|\
 			PEGIN_FEE_BPS|PEGOUT_FEE_BPS|PEGIN_FLAT_FEE_SAT|MIN_DEPOSIT_AMOUNT_SAT|ECX_DEPOSIT_MIN_CONFS|\
+			SOL_STIPEND_LAMPORTS|SOL_STIPEND_PRICE_SAT|SOL_STIPEND_USD_LABEL|\
 			ECX_ESPLORA_URL|SOLANA_RPC_URL|\
 			VPN_PROVIDER|VPN_WG_PRIVATE_KEY|VPN_WG_ADDRESS|VPN_WG_DNS|VPN_WG_PEER_PUBLIC_KEY|VPN_WG_ENDPOINT|VPN_WG_ALLOWED_IPS|VPN_PUBLIC_IPV4|\
 			HOP1_PROVIDER|HOP1_WG_PRIVATE_KEY|HOP1_WG_ADDRESS|HOP1_WG_DNS|HOP1_WG_PEER_PUBLIC_KEY|HOP1_WG_ENDPOINT|HOP1_WG_ALLOWED_IPS|\
@@ -123,6 +124,12 @@ validate_params() {
 	need CLOUDFLARE_TUNNEL_TOKEN "${CLOUDFLARE_TUNNEL_TOKEN:-}"
 	need CLOUDFLARE_HOSTNAME "${CLOUDFLARE_HOSTNAME:-}"
 
+	if [[ -n "${ASSET_TICKER:-}" ]]; then
+		[[ "$ASSET_TICKER" =~ ^[A-Za-z][A-Za-z0-9]{0,15}$ ]] || die "ASSET_TICKER must be 1-16 letters and digits, starting with a letter"
+	else
+		ASSET_TICKER=bECX
+	fi
+
 	reject_known_secret WALLET_MNEMONIC "$WALLET_MNEMONIC"
 	reject_known_secret SOLANA_KEYPAIR "$SOLANA_KEYPAIR"
 	# shellcheck disable=SC2206
@@ -158,6 +165,16 @@ validate_params() {
 	[[ "${MIN_DEPOSIT_AMOUNT_SAT:-500}" =~ ^[0-9]+$ ]] || die "MIN_DEPOSIT_AMOUNT_SAT must be an integer"
 	[[ "${ECX_DEPOSIT_MIN_CONFS:-3}" =~ ^[0-9]+$ ]] || die "ECX_DEPOSIT_MIN_CONFS must be an integer"
 	(( ${ECX_DEPOSIT_MIN_CONFS:-3} >= 1 )) || die "ECX_DEPOSIT_MIN_CONFS must be at least 1"
+	[[ "${SOL_STIPEND_LAMPORTS:-5000000}" =~ ^[0-9]+$ ]] || die "SOL_STIPEND_LAMPORTS must be an integer"
+	[[ "${SOL_STIPEND_PRICE_SAT:-500000}" =~ ^[0-9]+$ ]] || die "SOL_STIPEND_PRICE_SAT must be an integer"
+	if (( ${SOL_STIPEND_LAMPORTS:-5000000} == 0 && ${SOL_STIPEND_PRICE_SAT:-500000} == 0 )); then
+		:
+	elif (( ${SOL_STIPEND_LAMPORTS:-5000000} >= 1000000 && ${SOL_STIPEND_PRICE_SAT:-500000} >= 1 )); then
+		:
+	else
+		die "SOL stipend must be both 0, or at least 1000000 lamports and a positive ECX price"
+	fi
+	[[ -z "${SOL_STIPEND_USD_LABEL:-0.50}" || "${SOL_STIPEND_USD_LABEL:-0.50}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "SOL_STIPEND_USD_LABEL must look like 0.50"
 	[[ "${EARNINGS_THRESHOLD_ECX:-100}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "EARNINGS_THRESHOLD_ECX must be a positive amount"
 	[[ "${EARNINGS_THRESHOLD_WECX:-100}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "EARNINGS_THRESHOLD_WECX must be a positive amount"
 
@@ -207,6 +224,7 @@ WALLET_MNEMONIC="$WALLET_MNEMONIC"
 WALLET_PASSPHRASE="${WALLET_PASSPHRASE:-}"
 SOLANA_KEYPAIR="$SOLANA_KEYPAIR"
 WECX_MINT_ADDRESS="$WECX_MINT_ADDRESS"
+ASSET_TICKER="${ASSET_TICKER:-bECX}"
 ECX_ESPLORA_URL="${ECX_ESPLORA_URL:-https://explorer.beta.ecash.ninja/api/}"
 SOLANA_RPC_URL="${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}"
 PEGIN_FEE_BPS="${PEGIN_FEE_BPS:-100}"
@@ -214,6 +232,9 @@ PEGOUT_FEE_BPS="${PEGOUT_FEE_BPS:-100}"
 PEGIN_FLAT_FEE_SAT="${PEGIN_FLAT_FEE_SAT:-1000}"
 MIN_DEPOSIT_AMOUNT_SAT="${MIN_DEPOSIT_AMOUNT_SAT:-500}"
 ECX_DEPOSIT_MIN_CONFS="${ECX_DEPOSIT_MIN_CONFS:-3}"
+SOL_STIPEND_LAMPORTS="${SOL_STIPEND_LAMPORTS:-5000000}"
+SOL_STIPEND_PRICE_SAT="${SOL_STIPEND_PRICE_SAT:-500000}"
+SOL_STIPEND_USD_LABEL="${SOL_STIPEND_USD_LABEL:-0.50}"
 ALLOW_LIVE_PAYOUTS=0
 DATABASE_PATH=$OPT/backend/data/bridge.db
 EARNINGS_CONFIG_PATH=$ETC/earnings.toml
@@ -614,7 +635,7 @@ EOF
 
 	write_env_file "$ETC/backend.env"
 	write_earnings
-	printf 'PUBLIC_WECX_MINT=%s\n' "$WECX_MINT_ADDRESS" > "$ETC/frontend.env"
+	printf 'PUBLIC_WECX_MINT=%s\nPUBLIC_ASSET_TICKER=%s\n' "$WECX_MINT_ADDRESS" "${ASSET_TICKER:-bECX}" > "$ETC/frontend.env"
 	chmod 644 "$ETC/frontend.env"
 	printf 'TUNNEL_TOKEN=%s\n' "$CLOUDFLARE_TUNNEL_TOKEN" > "$ETC/cloudflared.env"
 	chown root:cloudflared "$ETC/cloudflared.env"
@@ -645,7 +666,7 @@ EOF
 
 	printf '\nInstalled. Payouts are off and the public tunnel is not started.\n'
 	cat /var/lib/ecash-bridge/deposit-addresses.txt
-	printf '\nDeposit ECX to the bc1q address. Deposit SOL and wECX to the Solana treasury.\n'
+	printf '\nDeposit %s to the bc1q address. Deposit SOL and w%s to the Solana treasury.\n' "${ASSET_TICKER:-bECX}" "${ASSET_TICKER:-bECX}"
 	printf 'Then run: sudo %s enable --i-deposited\n' "$ROOT/install.sh"
 }
 
@@ -654,6 +675,7 @@ main() {
 	WALLET_PASSPHRASE=""
 	SOLANA_KEYPAIR=""
 	WECX_MINT_ADDRESS=""
+	ASSET_TICKER=""
 	OWNER_ECX_ADDRESS=""
 	OWNER_SOL_ADDRESS=""
 	case "${1:-}" in

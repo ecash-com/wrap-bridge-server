@@ -1,5 +1,6 @@
 import { json, error } from '@sveltejs/kit';
 import { backendFetch, BackendError, readJsonBody } from '$lib/server/backend';
+import { wrappedTicker } from '$lib/tickers';
 import type { RequestHandler } from './$types';
 
 interface PegoutOrder {
@@ -19,7 +20,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		!Number.isInteger(amountInBaseUnits) ||
 		amountInBaseUnits <= 0
 	) {
-		throw error(400, 'amountInBaseUnits must be a positive integer (wbECX base units)');
+		throw error(400, `amountInBaseUnits must be a positive integer (${wrappedTicker()} base units)`);
 	}
 	if (typeof ecxRecipient !== 'string' || ecxRecipient.trim() === '') {
 		throw error(400, 'ecxRecipient is required');

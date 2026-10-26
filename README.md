@@ -1,6 +1,6 @@
 # ECX bridge
 
-Custodial bridge between ECX and wECX. This repository is only the bridge. It does not create the wECX mint and it does not create the AMM pool. The published mint is `EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq`. Put a different mint in `params.conf` if you run one.
+Custodial bridge for one asset at a time. The default display name is `bECX`, and the wrapped name is always `w` plus that name (`wbECX`). Set `ASSET_TICKER` to `ECX` or `aECX` if that is the name you want shown. This repository does not create the mint and it does not create the AMM pool. The published mint is `EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq`. Put a different mint in `params.conf` if you run one.
 
 Install on a new Ubuntu Server only after the tokens and wallets exist. The order is [docs/prepare.md](docs/prepare.md), then [params.conf.example](params.conf.example), then [docs/install.md](docs/install.md).
 
@@ -12,7 +12,7 @@ sudo ./install.sh "$HOME/bridge-params.conf"
 
 Payouts stay off until you deposit both treasuries and run `sudo ./install.sh enable --i-deposited`.
 
-The service takes ECX and pays wECX, or takes wECX and pays ECX. It holds both treasuries. It does not have mint authority.
+The service takes ECX and pays wECX, or takes wECX and pays ECX. It holds both treasuries. It does not have mint authority. On a wrap, the customer can pay a fixed extra amount of the native asset to receive a small SOL stipend in the same transaction. If the recipient has no token account, the order also adds that account's rent in native coin, 1:1, and only then. A wallet with no SOL can still receive the wrapped token.
 
 ## Parts
 

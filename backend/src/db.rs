@@ -44,7 +44,16 @@ CREATE TABLE IF NOT EXISTS bridge_orders (
     payout_signature TEXT,
     refund_txid TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    -- Wrap-only SOL stipend locked at order creation. 0 means the customer did not buy one.
+    -- The price is extra ECX they must deposit; it is not converted into wrapped tokens.
+    sol_stipend_lamports INTEGER NOT NULL DEFAULT 0 CHECK (sol_stipend_lamports >= 0),
+    sol_stipend_price_sat INTEGER NOT NULL DEFAULT 0 CHECK (sol_stipend_price_sat >= 0),
+    -- SOL rent for a recipient token account that did not exist when the order was created.
+    -- Locked then; not repriced if the account appears or disappears before payout. 0 if it existed.
+    ata_rent_lamports INTEGER NOT NULL DEFAULT 0 CHECK (ata_rent_lamports >= 0),
+    -- Native-coin price of that rent, 1:1 and rounded up. Included in amount_in_sat. Not a wrap fee.
+    ata_rent_price_sat INTEGER NOT NULL DEFAULT 0 CHECK (ata_rent_price_sat >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS bridge_orders_status_idx ON bridge_orders (status);
@@ -210,8 +219,60 @@ pub async fn open() -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .await
         .context("failed to apply bridge_orders schema")?;
+    conn.migrate()
+        .await
+        .context("failed to migrate bridge_orders schema")?;
 
     Ok(conn)
+}
+
+impl Connection {
+    /// Adds columns introduced after the first release. `CREATE TABLE IF NOT EXISTS` does not
+    /// alter an existing file.
+    async fn migrate(&self) -> Result<()> {
+        self.ensure_column(
+            "bridge_orders",
+            "sol_stipend_lamports",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        self.ensure_column(
+            "bridge_orders",
+            "sol_stipend_price_sat",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        self.ensure_column(
+            "bridge_orders",
+            "ata_rent_lamports",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        self.ensure_column(
+            "bridge_orders",
+            "ata_rent_price_sat",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let mut rows = self
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await
+            .with_context(|| format!("failed to inspect {table}"))?;
+        while let Some(row) = rows.next().await.context("failed to read table info")? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        self.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .await
+            .with_context(|| format!("failed to add {table}.{column}"))?;
+        Ok(())
+    }
 }
 
 /// Mirrors the `bridge_order_statuses` lookup table - kept as a Rust enum (rather than comparing
@@ -291,6 +352,17 @@ pub struct Order {
     pub refund_txid: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// SOL the customer bought with this wrap, in lamports. 0 if they did not. Locked at creation;
+    /// a short deposit is not sent this SOL (see `convert::settle_wrap_deposit`).
+    pub sol_stipend_lamports: i64,
+    /// Extra ECX, in sat, included in `amount_in_sat` to pay for the stipend. Not converted into
+    /// wrapped tokens. A refund still returns the full `amount_in_sat`.
+    pub sol_stipend_price_sat: i64,
+    /// Lamports the payout will spend to create this recipient's token account. 0 if it already
+    /// existed at order creation. Not repriced later.
+    pub ata_rent_lamports: i64,
+    /// Native-coin price of `ata_rent_lamports`, included in `amount_in_sat`. Not a wrap fee.
+    pub ata_rent_price_sat: i64,
 }
 
 pub struct NewOrder {
@@ -299,11 +371,16 @@ pub struct NewOrder {
     pub deposit_address: String,
     pub solana_recipient: String,
     pub refund_address: Option<String>,
+    pub sol_stipend_lamports: u64,
+    pub sol_stipend_price_sat: u64,
+    pub ata_rent_lamports: u64,
+    pub ata_rent_price_sat: u64,
 }
 
 const ORDER_COLUMNS: &str = "id, amount_in_sat, amount_out_base_units, deposit_address, \
     solana_recipient, refund_address, status, deposit_txid, payout_signature, refund_txid, \
-    created_at, updated_at";
+    created_at, updated_at, sol_stipend_lamports, sol_stipend_price_sat, \
+    ata_rent_lamports, ata_rent_price_sat";
 
 fn row_to_order(row: &Row) -> Result<Order> {
     let refund_address: String = row.get(5)?;
@@ -326,6 +403,10 @@ fn row_to_order(row: &Row) -> Result<Order> {
         refund_txid: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        sol_stipend_lamports: row.get(12)?,
+        sol_stipend_price_sat: row.get(13)?,
+        ata_rent_lamports: row.get(14)?,
+        ata_rent_price_sat: row.get(15)?,
     })
 }
 
@@ -335,12 +416,17 @@ pub async fn insert_order(conn: &Connection, order: &NewOrder) -> Result<Order> 
     let id = Uuid::new_v4().to_string();
     let amount_in_sat = to_i64(order.amount_in_sat)?;
     let amount_out_base_units = to_i64(order.amount_out_base_units)?;
+    let sol_stipend_lamports = to_i64(order.sol_stipend_lamports)?;
+    let sol_stipend_price_sat = to_i64(order.sol_stipend_price_sat)?;
+    let ata_rent_lamports = to_i64(order.ata_rent_lamports)?;
+    let ata_rent_price_sat = to_i64(order.ata_rent_price_sat)?;
 
     conn.execute(
         "INSERT INTO bridge_orders \
             (id, amount_in_sat, amount_out_base_units, deposit_address, solana_recipient, \
-             refund_address) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+             refund_address, sol_stipend_lamports, sol_stipend_price_sat, \
+             ata_rent_lamports, ata_rent_price_sat) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             id.as_str(),
             amount_in_sat,
@@ -348,6 +434,10 @@ pub async fn insert_order(conn: &Connection, order: &NewOrder) -> Result<Order> 
             order.deposit_address.as_str(),
             order.solana_recipient.as_str(),
             order.refund_address.as_deref().unwrap_or(""),
+            sol_stipend_lamports,
+            sol_stipend_price_sat,
+            ata_rent_lamports,
+            ata_rent_price_sat,
         ),
     )
     .await
@@ -594,7 +684,9 @@ pub async fn recent_orders(conn: &Connection, limit: u64) -> Result<Vec<RecentOr
 pub async fn completed_wrap_amounts(conn: &Connection) -> Result<Vec<(u64, u64)>> {
     completed_order_amounts(
         conn,
-        "SELECT amount_in_sat, amount_out_base_units FROM bridge_orders WHERE status = ?",
+        "SELECT MAX(amount_in_sat - sol_stipend_price_sat - ata_rent_price_sat, 0), \
+                amount_out_base_units \
+         FROM bridge_orders WHERE status = ?",
         OrderStatus::PaidOut.label(),
         "failed to query completed wraps",
     )
@@ -734,6 +826,29 @@ pub async fn update_deposit(
 /// nothing real to protect against) and any terminal status. Used to keep `create_order` and
 /// `detect_deposit`'s repricing from promising wECX that's already committed to other in-flight
 /// orders.
+/// SOL promised to wrap customers for a stipend or a new token account, not yet paid or expired.
+/// Includes `pending`, so the bridge cannot promise more SOL than the treasury can spare.
+pub async fn reserved_customer_sol_lamports(conn: &Connection) -> Result<u64> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(SUM(sol_stipend_lamports + ata_rent_lamports), 0) FROM bridge_orders \
+             WHERE status IN (?, ?, ?, ?) AND (sol_stipend_lamports > 0 OR ata_rent_lamports > 0)",
+            (
+                OrderStatus::Pending.label(),
+                OrderStatus::DepositSeen.label(),
+                OrderStatus::DepositConfirmed.label(),
+                OrderStatus::PayingOut.label(),
+            ),
+        )
+        .await
+        .context("failed to query reserved customer SOL")?;
+    let lamports: i64 = match rows.next().await.context("failed to read reserved SOL stipend")? {
+        Some(row) => row.get(0)?,
+        None => 0,
+    };
+    u64::try_from(lamports).context("reserved SOL stipend is negative")
+}
+
 pub async fn reserved_wecx_amount(conn: &Connection) -> Result<u64> {
     let mut rows = conn
         .query(
@@ -1407,6 +1522,44 @@ mod recent_order_tests {
         finish_earnings_sweep(&conn, "token-sweep", true).await.unwrap();
         assert_eq!(reserved_wecx_amount(&conn).await.unwrap(), 0);
         assert_eq!(paid_earnings(&conn).await.unwrap(), (10_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn stipend_columns_are_added_to_an_older_database() {
+        let conn = Connection(Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())));
+        conn.execute_batch(
+            "CREATE TABLE bridge_orders (
+                id TEXT PRIMARY KEY NOT NULL,
+                amount_in_sat INTEGER NOT NULL,
+                amount_out_base_units INTEGER NOT NULL,
+                deposit_address TEXT NOT NULL,
+                solana_recipient TEXT NOT NULL,
+                refund_address TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                deposit_txid TEXT,
+                payout_signature TEXT,
+                refund_txid TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .await
+        .unwrap();
+        conn.migrate().await.unwrap();
+        conn.migrate().await.unwrap();
+        conn.execute(
+            "INSERT INTO bridge_orders \
+                (id, amount_in_sat, amount_out_base_units, deposit_address, solana_recipient) \
+             VALUES ('old', 1, 1, 'dest', 'recip')",
+            (),
+        )
+        .await
+        .unwrap();
+        let order = get_order(&conn, "old").await.unwrap().unwrap();
+        assert_eq!(order.sol_stipend_lamports, 0);
+        assert_eq!(order.sol_stipend_price_sat, 0);
+        assert_eq!(order.ata_rent_lamports, 0);
+        assert_eq!(order.ata_rent_price_sat, 0);
     }
 
     #[tokio::test]

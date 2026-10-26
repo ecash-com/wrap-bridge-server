@@ -27,6 +27,10 @@ Write both secrets into the copy of `params.conf` and clear the terminal scrollb
 
 `WECX_MINT_ADDRESS` is the SPL mint this bridge holds and pays out. It is not a mint authority. The published mint is `EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq`. If you run a different mint, put that address here. The installer passes it to the backend and the frontend.
 
+`ASSET_TICKER` is the display name of the one asset this bridge wraps. Leave it as `bECX`, or set it to `ECX` or `aECX`. The wrapped name is always `w` plus that name, so those three are shown as `wbECX`, `wECX`, and `waECX`. It does not add a second asset.
+
+Wrap customers can check a box to buy a little SOL with extra native coin. The defaults are 0.005 SOL for 0.005 of the native asset (`SOL_STIPEND_LAMPORTS = "5000000"`, `SOL_STIPEND_PRICE_SAT = "500000"`). `SOL_STIPEND_USD_LABEL` is only the "about $0.50" text and will go stale. Set both amounts to `0` to hide the checkbox. The treasury pays that SOL. It also creates the recipient token account the first time that wallet receives the token. That rent is about 0.002 SOL. The order adds the same amount of native coin, 1:1 and rounded up, and only when the account is missing. The treasury still fronts the SOL, then the deposit pays it back. Keep the Solana treasury topped up beyond the fee reserve.
+
 ## 3. Owner addresses
 
 `OWNER_ECX_ADDRESS` is a `bc1q` address you control, on a different seed from the hot wallet. `OWNER_SOL_ADDRESS` is a Solana address you control, also not the hot wallet. Sweeps go there after the earnings threshold. Customer payouts do not wait for that threshold.
@@ -56,7 +60,7 @@ Copy the repository and the filled file to the Ubuntu 24.04 server. Do not copy 
 sudo ./install.sh "$HOME/bridge-params.conf"
 ```
 
-The installer brings up the VPN, builds the service, and prints the two deposit addresses. It does not open the site, and it does not send money. Deposit ECX to the printed `bc1q` address and deposit SOL plus wECX to the printed Solana treasury. Then:
+The installer brings up the VPN, builds the service, and prints the two deposit addresses. It does not open the site, and it does not send money. Deposit the native asset to the printed `bc1q` address and deposit SOL plus the wrapped token to the printed Solana treasury. Then:
 
 ```sh
 sudo ./install.sh enable --i-deposited

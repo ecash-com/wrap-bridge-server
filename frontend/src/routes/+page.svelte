@@ -17,6 +17,7 @@
 	} from '$lib/units.svelte';
 	import UnitToggle from '$lib/UnitToggle.svelte';
 	import PageTabs from '$lib/PageTabs.svelte';
+	import { assetTicker, wrappedTicker } from '$lib/tickers';
 	import { env } from '$env/dynamic/public';
 
 	const wecxMint = env.PUBLIC_WECX_MINT || 'EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq';
@@ -58,6 +59,10 @@
 	let wecxDecimals = $state<number | null>(null);
 	let minAmountIn = $state<number | null>(null);
 	let minAmountOutSat = $state<number | null>(null);
+	let solStipendLamports = $state(0);
+	let solStipendPriceSat = $state(0);
+	let solStipendUsdLabel = $state('');
+	let includeSol = $state(false);
 
 	$effect(() => {
 		let cancelled = false;
@@ -69,6 +74,9 @@
 				peginFlatFeeSat = data.peginFlatFeeSat;
 				wecxDecimals = data.wecxDecimals;
 				minAmountIn = data.minAmountIn;
+				solStipendLamports = data.solStipendLamports ?? 0;
+				solStipendPriceSat = data.solStipendPriceSat ?? 0;
+				solStipendUsdLabel = data.solStipendUsdLabel ?? '';
 			});
 		return () => {
 			cancelled = true;
@@ -191,6 +199,23 @@
 		return `${(fraction * 100).toFixed(fraction < 0.01 ? 2 : 1)}%`;
 	}
 
+	function formatExact(units: number, decimals: number): string {
+		const abs = Math.abs(Math.trunc(units));
+		const scale = 10 ** decimals;
+		const whole = Math.floor(abs / scale);
+		const frac = String(abs % scale)
+			.padStart(decimals, '0')
+			.replace(/0+$/, '');
+		return frac ? `${whole}.${frac}` : String(whole);
+	}
+
+	let solOfferVisible = $derived(
+		direction === 'pegin' && solStipendLamports > 0 && solStipendPriceSat > 0
+	);
+	let solUsdSuffix = $derived(
+		/^\d+(\.\d{1,2})?$/.test(solStipendUsdLabel) ? ` (about $${solStipendUsdLabel})` : ''
+	);
+
 	let submitting = $state(false);
 	let submitError = $state('');
 
@@ -206,7 +231,8 @@
 					body: JSON.stringify({
 						amountInSat: Math.round(parseFloat(amountIn) * 1e8),
 						solanaRecipient: recipientAddress,
-						refundAddress
+						refundAddress,
+						includeSolStipend: solOfferVisible && includeSol
 					})
 				});
 				if (!res.ok) {
@@ -286,8 +312,8 @@
 			<h1 class="text-2xl font-bold text-zinc-900 dark:text-white">Bridge</h1>
 			<p class="mt-1 text-sm text-zinc-500">
 				{direction === 'pegin'
-					? 'Bridge ECX to wbECX on Solana'
-					: 'Redeem wbECX on Solana back to ECX'}
+					? `Bridge ${assetTicker()} to ${wrappedTicker()} on Solana`
+					: `Redeem ${wrappedTicker()} on Solana back to ${assetTicker()}`}
 			</p>
 		</div>
 
@@ -311,7 +337,7 @@
 			<p class="text-xs leading-relaxed text-yellow-800 dark:text-yellow-300">
 				<span class="font-semibold">Beta warning:</span> This bridge sends real
 				<span class="font-semibold">Betanet eCash</span> and real
-				<span class="font-semibold">wbECX on Solana mainnet-beta</span>. Both are real money.
+				<span class="font-semibold">{wrappedTicker()} on Solana mainnet-beta</span>. Both are real money.
 				{#if direction === 'pegout'}
 					Your deposit must be sent from a wallet that supports
 					<span class="font-semibold">Solana Pay</span> (e.g. Phantom, Solflare) via the link/QR on the
@@ -409,7 +435,7 @@
 								class="flex items-center gap-2 rounded-full bg-violet-500/15 py-1.5 pr-4 pl-2 font-bold text-violet-600 dark:text-violet-400"
 							>
 								<img src="/wbecx-logo.svg" alt="" class="h-9 w-9" />
-								<span class="text-sm font-semibold text-zinc-900 dark:text-white">wbECX (Sol)</span>
+								<span class="text-sm font-semibold text-zinc-900 dark:text-white">{wrappedTicker()} (Sol)</span>
 							</span>
 							<a
 								href={solscanUrl}
@@ -468,7 +494,7 @@
 								class="flex items-center gap-2 rounded-full bg-violet-500/15 py-1.5 pr-4 pl-2 font-bold text-violet-600 dark:text-violet-400"
 							>
 								<img src="/wbecx-logo.svg" alt="" class="h-9 w-9" />
-								<span class="text-sm font-semibold text-zinc-900 dark:text-white">wbECX (Sol)</span>
+								<span class="text-sm font-semibold text-zinc-900 dark:text-white">{wrappedTicker()} (Sol)</span>
 							</span>
 							<a
 								href={solscanUrl}
@@ -534,7 +560,7 @@
 					     reading would be off by 8 orders of magnitude). -->
 					{#if direction === 'pegin'}
 						<span
-							>1 ECX = 1 wbECX{peginFeeFraction
+							>1 {assetTicker()} = 1 {wrappedTicker()}{peginFeeFraction
 								? ` (minus ${formatPercent(peginFeeFraction)} fee${
 										peginFlatFeeSat
 											? ` and ${presentSatAmount(peginFlatFeeSat)} ${ecxTicker()}`
@@ -544,7 +570,7 @@
 						>
 					{:else}
 						<span
-							>1 wbECX = 1 {ecxTicker()}{pegoutFeeFraction
+							>1 {wrappedTicker()} = 1 {assetTicker()}{pegoutFeeFraction
 								? ` (minus ${formatPercent(pegoutFeeFraction)} fee)`
 								: ''}</span
 						>
@@ -562,7 +588,9 @@
 			class="mt-3 rounded-xl bg-white p-4 ring-1 ring-black/5 dark:bg-zinc-900 dark:ring-white/5"
 		>
 			<label for="recipient" class="mb-2 block text-xs font-medium text-zinc-500">
-				{direction === 'pegin' ? 'Receive wbECX (Sol) at' : `Receive ${ecxTicker()} (betanet) at`}
+				{direction === 'pegin'
+					? `Receive ${wrappedTicker()} (Sol) at`
+					: `Receive ${assetTicker()} (betanet) at`}
 			</label>
 			<input
 				id="recipient"
@@ -573,8 +601,39 @@
 			/>
 		</div>
 
-		<!-- Refund address (pegin only - peg-out recovers its refund destination automatically from
-		     the deposit transaction itself, see backend/src/solana.rs's find_reference_deposit) -->
+		{#if solOfferVisible}
+			<label
+				class="mt-3 flex cursor-pointer items-start gap-3 rounded-xl bg-white p-4 ring-1 ring-black/5 dark:bg-zinc-900 dark:ring-white/5"
+			>
+				<input type="checkbox" bind:checked={includeSol} class="mt-0.5" />
+				<span class="text-sm text-zinc-800 dark:text-zinc-200">
+					Include {formatExact(solStipendLamports, 9)} SOL{solUsdSuffix} for {formatExact(
+						solStipendPriceSat,
+						8
+					)}
+					{assetTicker()}. Without SOL, you will be unable to move the {wrappedTicker()}.
+				</span>
+			</label>
+			<p class="mt-2 px-1 text-xs text-zinc-600">
+				The SOL is what lets you send {wrappedTicker()} afterwards. Receiving it does not require SOL.
+				{#if includeSol && amountIn}
+					The deposit address will ask for {presentSatAmount(
+						Math.round(parseFloat(amountIn) * 1e8) + solStipendPriceSat
+					)}
+					{ecxTicker()} in total, not just the amount above, plus a token-account charge if this
+					address does not have one yet.
+				{/if}
+			</p>
+		{/if}
+		{#if direction === 'pegin'}
+			<p class="mt-2 px-1 text-xs text-zinc-600">
+				If this address has no {wrappedTicker()} account, the next page adds the account-creation
+				cost (about 0.002 {assetTicker()}) to the total. You pay that only when the account has to
+				be created. It is not charged the wrap fee.
+			</p>
+		{/if}
+
+		<!-- Refund address is wrap-only. Unwrap recovers its refund destination from the deposit. -->
 		{#if direction === 'pegin'}
 			<div
 				class="mt-3 rounded-xl bg-white p-4 ring-1 ring-black/5 dark:bg-zinc-900 dark:ring-white/5"

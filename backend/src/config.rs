@@ -45,6 +45,28 @@ impl EarningsConfig {
     }
 }
 
+const DEFAULT_ASSET_TICKER: &str = "bECX";
+
+fn valid_ticker(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric())
+        && value.len() <= 16
+}
+
+/// Display name of the one asset this bridge wraps. The wrapped name is always "w" plus this.
+pub fn asset_ticker() -> String {
+    std::env::var("ASSET_TICKER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| valid_ticker(value))
+        .unwrap_or_else(|| DEFAULT_ASSET_TICKER.to_string())
+}
+
+pub fn wrapped_ticker() -> String {
+    format!("w{}", asset_ticker())
+}
+
 fn coin_amount(text: &str, decimals: u8) -> Result<u64> {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     anyhow::ensure!(
@@ -311,6 +333,39 @@ pub fn pegin_flat_fee_sat() -> u64 {
     env_u64("PEGIN_FLAT_FEE_SAT", 1_000)
 }
 
+/// Optional wrap-only SOL stipend. A customer who checks the box pays `price_sat` extra ECX and
+/// receives `lamports` of SOL in the same transaction as the wrapped tokens. Both values come from
+/// the operator. A zero, a one-sided pair, or a stipend below 0.001 SOL disables the offer rather
+/// than giving SOL away or sending an amount a brand-new wallet cannot hold.
+pub struct SolStipendOffer {
+    pub lamports: u64,
+    pub price_sat: u64,
+    pub usd_label: String,
+}
+
+pub fn sol_stipend_offer() -> SolStipendOffer {
+    const MIN_LAMPORTS: u64 = 1_000_000;
+    let lamports = env_u64("SOL_STIPEND_LAMPORTS", 5_000_000);
+    let price_sat = env_u64("SOL_STIPEND_PRICE_SAT", 500_000);
+    let usd_label = std::env::var("SOL_STIPEND_USD_LABEL").unwrap_or_else(|_| "0.50".to_string());
+    let usd_label = usd_label.trim();
+    let usd_label = if usd_label.is_empty()
+        || usd_label.len() > 8
+        || !usd_label.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || usd_label.matches('.').count() > 1
+        || usd_label.starts_with('.')
+        || usd_label.ends_with('.')
+    {
+        String::new()
+    } else {
+        usd_label.to_string()
+    };
+    if lamports == 0 || price_sat == 0 || lamports < MIN_LAMPORTS {
+        return SolStipendOffer { lamports: 0, price_sat: 0, usd_label };
+    }
+    SolStipendOffer { lamports, price_sat, usd_label }
+}
+
 /// Flat fee for the wECX->ECX peg-out direction, in basis points, from `PEGOUT_FEE_BPS` (default
 /// 100 = 1%). Values above 10000 are rejected rather than saturating the payout to zero.
 pub fn pegout_fee_bps() -> u64 {
@@ -393,6 +448,32 @@ mod tests {
         assert_eq!(deposit_min_confs(), 1);
         unsafe {
             std::env::remove_var("ECX_DEPOSIT_MIN_CONFS");
+        }
+    }
+
+    #[test]
+    fn asset_ticker_defaults_and_rejects_malformed_names() {
+        unsafe {
+            std::env::remove_var("ASSET_TICKER");
+        }
+        assert_eq!(asset_ticker(), "bECX");
+        assert_eq!(wrapped_ticker(), "wbECX");
+        unsafe {
+            std::env::set_var("ASSET_TICKER", "ECX");
+        }
+        assert_eq!(asset_ticker(), "ECX");
+        assert_eq!(wrapped_ticker(), "wECX");
+        unsafe {
+            std::env::set_var("ASSET_TICKER", "aECX");
+        }
+        assert_eq!(asset_ticker(), "aECX");
+        assert_eq!(wrapped_ticker(), "waECX");
+        unsafe {
+            std::env::set_var("ASSET_TICKER", "1bad");
+        }
+        assert_eq!(asset_ticker(), "bECX");
+        unsafe {
+            std::env::remove_var("ASSET_TICKER");
         }
     }
 

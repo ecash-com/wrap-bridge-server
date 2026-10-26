@@ -15,6 +15,10 @@ interface OrderResponse {
 	refund_txid: string | null;
 	created_at: number;
 	updated_at: number;
+	sol_stipend_lamports: number;
+	sol_stipend_price_sat: number;
+	ata_rent_lamports: number;
+	ata_rent_price_sat: number;
 }
 
 export const GET: RequestHandler = async ({ params }) => {
@@ -31,7 +35,11 @@ export const GET: RequestHandler = async ({ params }) => {
 			status: order.status,
 			depositTxid: order.deposit_txid,
 			payoutSignature: order.payout_signature,
-			refundTxid: order.refund_txid
+			refundTxid: order.refund_txid,
+			solStipendLamports: order.sol_stipend_lamports,
+			solStipendPriceSat: order.sol_stipend_price_sat,
+			ataRentLamports: order.ata_rent_lamports,
+			ataRentPriceSat: order.ata_rent_price_sat
 		});
 	} catch (e) {
 		if (e instanceof BackendError) throw error(e.status, e.message);

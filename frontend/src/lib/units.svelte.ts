@@ -1,8 +1,9 @@
+import { assetTicker } from '$lib/tickers';
+
 const STORAGE_KEY = 'displayUnit';
 
 export type Unit = 'main' | 'smallest';
 
-const MAIN_TICKER = 'bECX';
 const SMALLEST_TICKER = 'szats';
 
 function readInitialUnit(): Unit {
@@ -32,13 +33,14 @@ export function toggleUnit() {
 // deposit side). wECX is always shown in whole-token terms via formatBaseUnits below, since its
 // decimals vary by mint and "smallest unit" isn't a meaningful toggle for it the way sats/szats is.
 export function ecxTicker(): string {
-	return unit === 'smallest' ? SMALLEST_TICKER : MAIN_TICKER;
+	return unit === 'smallest' ? SMALLEST_TICKER : assetTicker();
 }
 
 // Asset name for the token pill: same as the ticker, but spells out that szats are just a
-// different view of bECX rather than a separate asset.
+// different view of the native asset rather than a separate asset.
 export function ecxAssetLabel(): string {
-	return unit === 'smallest' ? `${MAIN_TICKER} (in ${SMALLEST_TICKER})` : MAIN_TICKER;
+	const ticker = assetTicker();
+	return unit === 'smallest' ? `${ticker} (in ${SMALLEST_TICKER})` : ticker;
 }
 
 // Formats an ECX amount given in main units (ECX) for display, honoring the current unit

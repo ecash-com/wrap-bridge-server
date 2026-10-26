@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import QRCode from 'qrcode';
 	import { saveStoredOrder } from '$lib/orderHistory';
+	import { wrappedTicker } from '$lib/tickers';
 	import { ecxTicker, presentSatAmount, formatBaseUnits } from '$lib/units.svelte';
 
 	interface Order {
@@ -15,9 +16,23 @@
 		depositTxid: string | null;
 		payoutSignature: string | null;
 		refundTxid: string | null;
+		solStipendLamports: number;
+		solStipendPriceSat: number;
+		ataRentLamports: number;
+		ataRentPriceSat: number;
 	}
 
 	const UNIT_SCALE = 1e8;
+
+	function formatExact(units: number, decimals: number): string {
+		const abs = Math.abs(Math.trunc(units));
+		const scale = 10 ** decimals;
+		const whole = Math.floor(abs / scale);
+		const frac = String(abs % scale)
+			.padStart(decimals, '0')
+			.replace(/0+$/, '');
+		return frac ? `${whole}.${frac}` : String(whole);
+	}
 
 	let order = $state<Order | null>(null);
 	let loadError = $state('');
@@ -206,9 +221,23 @@
 			<div class="mb-6 text-center">
 				<h1 class="text-2xl font-bold text-zinc-900 dark:text-white">
 					{presentSatAmount(order.amountInSat)}
-					{ecxTicker()} → {amountOut(order)} wbECX
+					{ecxTicker()} → {amountOut(order)} {wrappedTicker()}
 				</h1>
 				<p class="mt-1 font-mono text-xs text-zinc-600">{order.id}</p>
+				{#if order.ataRentPriceSat > 0}
+					<p class="mx-auto mt-3 max-w-md text-sm text-zinc-600 dark:text-zinc-400">
+						This address had no {wrappedTicker()} account, so {presentSatAmount(order.ataRentPriceSat)}
+						{ecxTicker()} in the amount above pays for creating it. That cost matches the SOL rent 1:1
+						and is not charged the wrap fee.
+					</p>
+				{/if}
+				{#if order.solStipendLamports > 0}
+					<p class="mx-auto mt-3 max-w-md text-sm text-zinc-600 dark:text-zinc-400">
+						Includes {formatExact(order.solStipendLamports, 9)} SOL,
+						paid for with {presentSatAmount(order.solStipendPriceSat)} {ecxTicker()} in the amount
+						above. That SOL arrives in the same transaction as the {wrappedTicker()}.
+					</p>
+				{/if}
 			</div>
 
 			<div
@@ -260,17 +289,17 @@
 					{/if}
 				{:else if order.status === 'deposit_confirmed' || order.status === 'paying_out'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						Deposit confirmed — sending your wbECX now…
+						Deposit confirmed — sending your {wrappedTicker()} now…
 					</p>
 					{#if canSetRefundAddress}
 						{@render refundAddressForm()}
 					{/if}
 				{:else if order.status === 'paid_out'}
 					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">
-						wbECX sent!
+						{wrappedTicker()} sent!
 					</p>
 					<p class="mt-2 text-center text-xs text-zinc-500">
-						You received {amountOut(order)} wbECX at {order.solanaRecipient}
+						You received {amountOut(order)} {wrappedTicker()} at {order.solanaRecipient}
 					</p>
 					{#if order.payoutSignature}
 						<p class="mt-2 truncate text-center font-mono text-[10px] text-zinc-600">

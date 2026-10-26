@@ -1,5 +1,6 @@
 <script lang="ts">
 	import PageTabs from '$lib/PageTabs.svelte';
+	import { wrappedTicker } from '$lib/tickers';
 	import { env } from '$env/dynamic/public';
 
 	const WECX_MINT = env.PUBLIC_WECX_MINT || 'EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq';
@@ -22,13 +23,13 @@
 		{
 			name: 'Phantom',
 			description:
-				'Popular Solana wallet with a built-in swapper. Add wbECX to your wallet, then use Swap.',
+				`Popular Solana wallet with a built-in swapper. Add ${wrappedTicker()} to your wallet, then use Swap.`,
 			url: 'https://phantom.com'
 		},
 		{
 			name: 'Solflare',
 			description:
-				'Long-standing Solana wallet with built-in swaps. Add wbECX to your wallet, then use Swap.',
+				`Long-standing Solana wallet with built-in swaps. Add ${wrappedTicker()} to your wallet, then use Swap.`,
 			url: 'https://solflare.com'
 		}
 	];
@@ -36,14 +37,14 @@
 	const linkClass = 'rounded-lg px-3 py-2 text-center text-sm font-semibold transition-colors';
 </script>
 
-<svelte:head><title>Buy / Sell wbECX</title></svelte:head>
+<svelte:head><title>Buy / Sell {wrappedTicker()}</title></svelte:head>
 
 <div class="flex min-h-screen items-center justify-center bg-zinc-50 px-4 py-12 dark:bg-zinc-950">
 	<div class="w-full max-w-md">
 		<PageTabs active="trade" />
 		<div class="mb-6 text-center">
-			<h1 class="text-2xl font-bold text-zinc-900 dark:text-white">Buy / Sell wbECX</h1>
-			<p class="mt-1 text-sm text-zinc-500">Trusted places to trade wbECX on Solana</p>
+			<h1 class="text-2xl font-bold text-zinc-900 dark:text-white">Buy / Sell {wrappedTicker()}</h1>
+			<p class="mt-1 text-sm text-zinc-500">Trusted places to trade {wrappedTicker()} on Solana</p>
 		</div>
 
 		<div class="flex flex-col gap-3">
@@ -59,14 +60,14 @@
 								href={venue.buyUrl}
 								target="_blank"
 								rel="noopener noreferrer"
-								class="{linkClass} bg-violet-500 text-white hover:bg-violet-600">Buy wbECX ↗</a
+								class="{linkClass} bg-violet-500 text-white hover:bg-violet-600">Buy {wrappedTicker()} ↗</a
 							>
 							<a
 								href={venue.sellUrl}
 								target="_blank"
 								rel="noopener noreferrer"
 								class="{linkClass} bg-zinc-100 text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-white dark:hover:bg-zinc-700"
-								>Sell wbECX ↗</a
+								>Sell {wrappedTicker()} ↗</a
 							>
 						{:else}
 							<a
@@ -83,7 +84,7 @@
 		</div>
 
 		<div class="mt-4 rounded-xl bg-zinc-100 px-4 py-3 dark:bg-zinc-800/60">
-			<p class="text-xs font-medium text-zinc-500">wbECX token address</p>
+			<p class="text-xs font-medium text-zinc-500">{wrappedTicker()} token address</p>
 			<p class="mt-1 font-mono text-xs break-all text-zinc-900 dark:text-white">{WECX_MINT}</p>
 			<a
 				href="https://solscan.io/token/{WECX_MINT}"

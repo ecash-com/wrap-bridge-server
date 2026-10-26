@@ -13,7 +13,9 @@ manual CLI send requires an explicit opt-in (see **Safety** below).
 - **Peg-in (ECX → wECX):** a user requests an order, the backend hands back a
   fresh ECX deposit address, a background poller waits for the deposit to
   confirm, then sends wECX for that deposit minus 0.00001000 ECX and a 1% fee
-  from the treasury's associated token account to the user's Solana address.
+  from the treasury's associated token account to the user's Solana address. A recipient
+  with no token account pays that account's rent in native coin, 1:1, locked when the order
+  is created.
 - **Peg-out (wECX → ECX):** a user requests an order and sends wECX to the
   treasury with a Solana Pay reference key; the backend matches the deposit
   by that reference (Solana has no per-order address scheme) and sends ECX

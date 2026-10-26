@@ -9,6 +9,9 @@ WALLET_MNEMONIC = ""
 WALLET_PASSPHRASE = ""
 SOLANA_KEYPAIR = ""
 WECX_MINT_ADDRESS = "EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq"
+# Display name of the one asset this bridge wraps. The wrapped token is always "w" plus this.
+# bECX is shown as bECX and wbECX. ECX is shown as ECX and wECX. aECX is shown as aECX and waECX.
+ASSET_TICKER = "bECX"
 
 # --- Owner sweeps. Customer payouts stay immediate. ---
 OWNER_ECX_ADDRESS = ""
@@ -22,6 +25,12 @@ PEGOUT_FEE_BPS = "100"
 PEGIN_FLAT_FEE_SAT = "1000"
 MIN_DEPOSIT_AMOUNT_SAT = "500"
 ECX_DEPOSIT_MIN_CONFS = "3"
+# Optional wrap checkbox: extra ECX buys a little SOL so a new wallet can move the wrapped token.
+# 5000000 lamports = 0.005 SOL. 500000 sat = 0.005 of the native asset. Set both to 0 to hide it.
+# The dollar label is display-only and goes stale. The treasury pays the SOL and token-account rent.
+SOL_STIPEND_LAMPORTS = "5000000"
+SOL_STIPEND_PRICE_SAT = "500000"
+SOL_STIPEND_USD_LABEL = "0.50"
 
 # --- Chain endpoints. Leave these unless you run your own. ---
 ECX_ESPLORA_URL = "https://explorer.beta.ecash.ninja/api/"

@@ -5,6 +5,7 @@
 		type StoredOrder,
 		type StoredPegoutOrder
 	} from '$lib/orderHistory';
+	import { wrappedTicker } from '$lib/tickers';
 	import { ecxTicker, presentSatAmount, formatBaseUnits } from '$lib/units.svelte';
 
 	function formatDate(ms: number): string {
@@ -90,9 +91,9 @@
 							<span class="text-sm font-semibold text-zinc-900 dark:text-white">
 								{#if row.direction === 'pegin'}
 									{presentSatAmount(row.order.amountInSat)}
-									{ecxTicker()} → {amountOut(row.order)} wbECX
+									{ecxTicker()} → {amountOut(row.order)} {wrappedTicker()}
 								{:else}
-									{amountIn(row.order)} wbECX → {presentSatAmount(row.order.amountOutSat)}
+									{amountIn(row.order)} {wrappedTicker()} → {presentSatAmount(row.order.amountOutSat)}
 									{ecxTicker()}
 								{/if}
 							</span>

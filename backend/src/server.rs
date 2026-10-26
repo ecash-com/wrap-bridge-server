@@ -127,6 +127,12 @@ struct QuoteResponse {
     /// Smallest `amount_in_sat` that `POST /orders` will accept. This is the configured minimum
     /// raised, when needed, so the deposit still pays out after the flat fee.
     min_amount_in_sat: u64,
+    /// Optional wrap-only SOL stipend. Both zero means the checkbox is hidden. The price is extra
+    /// ECX on top of the wrap amount; it is not included in `amount_out_base_units`.
+    sol_stipend_lamports: u64,
+    sol_stipend_price_sat: u64,
+    /// Display-only estimate, such as "0.50". Empty when the operator did not set a usable label.
+    sol_stipend_usd_label: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -259,6 +265,7 @@ async fn get_quote(State(state): State<Arc<AppState>>, Query(query): Query<Quote
     let amount_out_base_units = query.amount_in_sat.map(|sat| {
         convert::pegin_payout_base_units(sat, decimals, pegin_fee_bps, flat_fee_sat)
     });
+    let stipend = config::sol_stipend_offer();
 
     Json(QuoteResponse {
         amount_in_sat: query.amount_in_sat,
@@ -273,6 +280,9 @@ async fn get_quote(State(state): State<Arc<AppState>>, Query(query): Query<Quote
             pegin_fee_bps,
             flat_fee_sat,
         ),
+        sol_stipend_lamports: stipend.lamports,
+        sol_stipend_price_sat: stipend.price_sat,
+        sol_stipend_usd_label: stipend.usd_label,
     })
 }
 
@@ -286,6 +296,10 @@ struct CreateOrderRequest {
     /// be refunded: it just sits recorded for manual review instead.
     #[serde(default)]
     refund_address: Option<String>,
+    /// Wrap only. The customer pays `config::sol_stipend_offer` extra ECX and receives that SOL
+    /// with the wrapped tokens. The amount is not chosen by the client.
+    #[serde(default)]
+    include_sol_stipend: bool,
 }
 
 /// Creates an order: converts `amount_in_sat` to a wECX amount via the bridge's flat 1:1-minus-fee
@@ -341,11 +355,30 @@ async fn create_order(
                 .map_err(|e| {
                     (
                         StatusCode::BAD_REQUEST,
-                        format!("refund_address is not a valid ECX address: {e}"),
+                        format!("refund_address is not a valid {} address: {e}", config::asset_ticker()),
                     )
                 })?,
         ),
     };
+
+    let stipend = if req.include_sol_stipend {
+        let offer = config::sol_stipend_offer();
+        if offer.lamports == 0 || offer.price_sat == 0 {
+            return Err((StatusCode::BAD_REQUEST, "a SOL stipend is not offered".to_string()));
+        }
+        offer
+    } else {
+        config::SolStipendOffer { lamports: 0, price_sat: 0, usd_label: String::new() }
+    };
+    if req.amount_in_sat.saturating_add(stipend.price_sat) > config::max_deposit_amount().to_sat() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "amount_in_sat plus the SOL stipend is above the maximum order amount ({} sat)",
+                config::max_deposit_amount().to_sat()
+            ),
+        ));
+    }
 
     let amount_out = convert::pegin_payout_base_units(
         req.amount_in_sat,
@@ -356,7 +389,10 @@ async fn create_order(
     if amount_out == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
-            "amount_in_sat is too small to bridge any wECX after fees/decimal rounding".to_string(),
+            format!(
+                "amount_in_sat is too small to bridge any {} after fees/decimal rounding",
+                config::wrapped_ticker()
+            ),
         ));
     }
 
@@ -373,6 +409,49 @@ async fn create_order(
         ));
     }
 
+    // One RPC check per admitted order, not per quote keystroke. The result is locked on the row
+    // and is not repriced if the account appears or disappears during the confirmation window.
+    let ata_rent_lamports = match state.solana.missing_recipient_ata_rent(&recipient).await {
+        Ok(lamports) => lamports,
+        Err(e) => {
+            let text = format!("{e:#}");
+            if text.contains("not a token account") {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "that Solana address cannot receive {}",
+                        config::wrapped_ticker()
+                    ),
+                ));
+            }
+            eprintln!("[create_order] recipient token-account check failed: {e:#}");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not check this address's token account - retry".to_string(),
+            ));
+        }
+    };
+    let ata_rent_price_sat = convert::sol_lamports_to_ecx_sat(ata_rent_lamports);
+    let deposit_sat = req
+        .amount_in_sat
+        .checked_add(stipend.price_sat)
+        .and_then(|total| total.checked_add(ata_rent_price_sat))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "amount_in_sat plus the extra charges overflows".to_string(),
+            )
+        })?;
+    if deposit_sat > config::max_deposit_amount().to_sat() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "amount_in_sat plus the extra charges is above the maximum order amount ({} sat)",
+                config::max_deposit_amount().to_sat()
+            ),
+        ));
+    }
+
     let sol_lamports = state.solana.sol_balance_lamports().await.map_err(internal_error)?;
     if sol_lamports < config::treasury_min_sol_lamports() {
         eprintln!(
@@ -383,6 +462,30 @@ async fn create_order(
             StatusCode::SERVICE_UNAVAILABLE,
             "the bridge is temporarily unavailable".to_string(),
         ));
+    }
+    let extra_sol = stipend.lamports.saturating_add(ata_rent_lamports);
+    if extra_sol > 0 {
+        let reserved = db::reserved_customer_sol_lamports(&state.db)
+            .await
+            .map_err(internal_error)?;
+        let needed = config::treasury_min_sol_lamports()
+            .saturating_add(reserved)
+            .saturating_add(extra_sol);
+        if sol_lamports < needed {
+            eprintln!(
+                "[create_order] not enough spare SOL: balance {sol_lamports}, reserved {reserved}, \
+                 stipend {}, token-account rent {ata_rent_lamports}",
+                stipend.lamports
+            );
+            let message = if ata_rent_lamports > 0 && stipend.lamports == 0 {
+                "not enough SOL is available to open a token account for that address right now - \
+                 retry later"
+            } else {
+                "not enough SOL is available for that option right now - leave it unchecked or \
+                 retry later"
+            };
+            return Err((StatusCode::SERVICE_UNAVAILABLE, message.to_string()));
+        }
     }
 
     let treasury_balance = state
@@ -399,9 +502,11 @@ async fn create_order(
         );
         return Err((
             StatusCode::CONFLICT,
-            "not enough wECX liquidity available for that amount right now - try a smaller amount \
-             or retry later"
-                .to_string(),
+            format!(
+                "not enough {} liquidity available for that amount right now - try a smaller amount \
+                 or retry later",
+                config::wrapped_ticker()
+            ),
         ));
     }
 
@@ -415,11 +520,15 @@ async fn create_order(
     let order = db::insert_order(
         &state.db,
         &db::NewOrder {
-            amount_in_sat: req.amount_in_sat,
+            amount_in_sat: deposit_sat,
             amount_out_base_units: amount_out,
             deposit_address: deposit_address.to_string(),
             solana_recipient: recipient.to_string(),
             refund_address: refund_address.map(|a| a.to_string()),
+            sol_stipend_lamports: stipend.lamports,
+            sol_stipend_price_sat: stipend.price_sat,
+            ata_rent_lamports,
+            ata_rent_price_sat,
         },
     )
     .await
@@ -513,19 +622,16 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
     };
     let actual_amount_in = Amount::from_sat(actual_sat);
 
+    let settled = settle_order_deposit(&order, actual_amount_in.to_sat(), state.solana.decimals());
     if new_status.label() == order.status
         && order.deposit_txid.as_deref() == Some(deposit_txid.as_str())
         && actual_amount_in.to_sat() as i64 == order.amount_in_sat
+        && settled.amount_out_base_units as i64 == order.amount_out_base_units
     {
         return Ok(order);
     }
 
-    let amount_out = convert::pegin_payout_base_units(
-        actual_amount_in.to_sat(),
-        state.solana.decimals(),
-        config::pegin_fee_bps(),
-        config::pegin_flat_fee_sat(),
-    );
+    let amount_out = settled.amount_out_base_units;
 
     // Conditional write (see `db::update_deposit`): `order` is a snapshot that another task may
     // already have moved past `pending`/`deposit_seen` - possibly all the way to a payout in
@@ -557,11 +663,12 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
     };
 
     if new_status == OrderStatus::DepositConfirmed
-        && !payout_viable(actual_amount_in.to_sat(), amount_out)
+        && (settled.ata_rent_uncovered || !payout_viable(settled.wrap_sat, amount_out))
         && updated.refund_address.is_some()
     {
         eprintln!(
-            "[detect_deposit] order {}: deposit is below the minimum or reprices to zero wECX -> requesting refund",
+            "[detect_deposit] order {}: deposit cannot cover a new token account, is below the \
+             minimum, or reprices to zero wECX -> requesting refund",
             short(&updated.id)
         );
         if db::request_refund(&state.db, &updated.id).await? {
@@ -577,6 +684,20 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
 /// bypassed by quoting big and sending small) and nonzero after fee/decimal rounding. Each payout
 /// to a new recipient costs the treasury real SOL in token-account rent, so sub-minimum deposits
 /// are a cost attack, not just dust.
+fn settle_order_deposit(order: &db::Order, actual_sat: u64, wecx_decimals: u8) -> convert::SettledWrap {
+    convert::settle_wrap_deposit(
+        actual_sat,
+        order.sol_stipend_lamports.max(0) as u64,
+        order.sol_stipend_price_sat.max(0) as u64,
+        wecx_decimals,
+        config::pegin_fee_bps(),
+        config::pegin_flat_fee_sat(),
+        config::min_deposit_amount().to_sat(),
+        order.ata_rent_lamports.max(0) as u64,
+        order.ata_rent_price_sat.max(0) as u64,
+    )
+}
+
 fn payout_viable(amount_in_sat: u64, amount_out_base_units: u64) -> bool {
     amount_out_base_units > 0 && amount_in_sat >= config::min_deposit_amount().to_sat()
 }
@@ -661,7 +782,29 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
         return Ok(order);
     }
 
-    if !payout_viable(order.amount_in_sat as u64, order.amount_out_base_units as u64) {
+    let settled = settle_order_deposit(&order, order.amount_in_sat.max(0) as u64, state.solana.decimals());
+    if settled.ata_rent_uncovered {
+        eprintln!(
+            "[try_fulfill] order {}: deposit cannot cover the locked token-account rent - not \
+             paying out",
+            short(&order.id)
+        );
+        if order.refund_address.is_some() && db::request_refund(&state.db, &order.id).await? {
+            return Ok(db::Order {
+                status: OrderStatus::RefundRequested.label().to_string(),
+                ..order
+            });
+        }
+        return Ok(order);
+    }
+    if settled.amount_out_base_units != order.amount_out_base_units.max(0) as u64 {
+        eprintln!(
+            "[try_fulfill] order {}: stored payout does not match the settled deposit - holding",
+            short(&order.id)
+        );
+        return Ok(order);
+    }
+    if !payout_viable(settled.wrap_sat, settled.amount_out_base_units) {
         eprintln!(
             "[try_fulfill] order {}: deposit is below the minimum or reprices to zero wECX - not \
              paying out, needs manual review/refund",
@@ -671,10 +814,13 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
     }
 
     let sol_lamports = state.solana.sol_balance_lamports().await?;
-    if sol_lamports < config::treasury_min_sol_lamports() {
+    let sol_needed = config::treasury_min_sol_lamports()
+        .saturating_add(settled.sol_stipend_lamports)
+        .saturating_add(settled.ata_rent_lamports);
+    if sol_lamports < sol_needed {
         eprintln!(
             "[try_fulfill] order {}: treasury SOL balance {sol_lamports} lamports is below \
-             TREASURY_MIN_SOL_LAMPORTS - payout held, top the treasury up",
+             {sol_needed} (reserve plus stipend and token-account rent) - payout held, top the treasury up",
             short(&order.id)
         );
         return Ok(order);
@@ -698,11 +844,25 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
         return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
     }
 
-    eprintln!("[try_fulfill] order {}: sending wECX payout", short(&order.id));
+    if settled.sol_stipend_lamports > 0 || settled.ata_rent_lamports > 0 {
+        eprintln!(
+            "[try_fulfill] order {}: sending wECX payout, {} lamports of token-account rent, \
+             {} lamports of SOL stipend",
+            short(&order.id),
+            settled.ata_rent_lamports,
+            settled.sol_stipend_lamports
+        );
+    } else {
+        eprintln!("[try_fulfill] order {}: sending wECX payout", short(&order.id));
+    }
 
     let prepared = match state
         .solana
-        .prepare_wecx_transfer(recipient, order.amount_out_base_units as u64)
+        .prepare_wecx_transfer(
+            recipient,
+            order.amount_out_base_units as u64,
+            settled.sol_stipend_lamports,
+        )
         .await
     {
         Ok(p) => p,
@@ -1268,7 +1428,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
 
     let prepared = match state
         .solana
-        .prepare_wecx_transfer(recipient, order.amount_in_base_units as u64)
+        .prepare_wecx_transfer(recipient, order.amount_in_base_units as u64, 0)
         .await
     {
         Ok(p) => p,
@@ -1486,7 +1646,10 @@ async fn set_refund_address(
         .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("refund_address is not a valid ECX address: {e}"),
+                format!(
+                    "refund_address is not a valid {} address: {e}",
+                    config::asset_ticker()
+                ),
             )
         })?;
 
@@ -1585,7 +1748,10 @@ async fn create_pegout_order(
         .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("ecx_recipient is not a valid ECX address: {e}"),
+                format!(
+                    "ecx_recipient is not a valid {} address: {e}",
+                    config::asset_ticker()
+                ),
             )
         })?;
 
@@ -1599,8 +1765,9 @@ async fn create_pegout_order(
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "amount_in_base_units is too small to bridge at least the minimum ECX payout \
-                 ({min_out} sat) after fees/decimal rounding"
+                "amount_in_base_units is too small to bridge at least the minimum {} payout \
+                 ({min_out} sat) after fees/decimal rounding",
+                config::asset_ticker()
             ),
         ));
     }
@@ -1637,9 +1804,11 @@ async fn create_pegout_order(
         );
         return Err((
             StatusCode::CONFLICT,
-            "not enough ECX liquidity available for that amount right now - try a smaller amount \
-             or retry later"
-                .to_string(),
+            format!(
+                "not enough {} liquidity available for that amount right now - try a smaller amount \
+                 or retry later",
+                config::asset_ticker()
+            ),
         ));
     }
 
@@ -1810,7 +1979,7 @@ async fn sweep_earnings_once(state: &AppState) -> anyhow::Result<()> {
             }
             let destination = solana::parse_pubkey(&settings.solana_owner_address)?;
             state.solana.validate_recipient(&destination)?;
-            let prepared = state.solana.prepare_wecx_transfer(destination, amount).await?;
+            let prepared = state.solana.prepare_wecx_transfer(destination, amount, 0).await?;
             sweep.destination = destination.to_string();
             sweep.transaction_id = prepared.signature.to_string();
             db::record_earnings_sweep(&state.db, &sweep).await?;

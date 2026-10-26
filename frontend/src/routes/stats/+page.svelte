@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
+	import { assetTicker, wrappedTicker } from '$lib/tickers';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -44,9 +45,9 @@
 	function formatOrderAmount(order: (typeof data.stats.recent_orders)[number], input: boolean) {
 		const amount = input ? order.amount_in : order.amount_out;
 		if (order.direction === 'wrap') {
-			return `${formatUnits(amount, input ? 8 : data.stats.wecx_decimals)} ${input ? 'bECX' : 'wbECX'}`;
+			return `${formatUnits(amount, input ? 8 : data.stats.wecx_decimals)} ${input ? assetTicker() : wrappedTicker()}`;
 		}
-		return `${formatUnits(amount, input ? data.stats.wecx_decimals : 8)} ${input ? 'wbECX' : 'bECX'}`;
+		return `${formatUnits(amount, input ? data.stats.wecx_decimals : 8)} ${input ? wrappedTicker() : assetTicker()}`;
 	}
 
 	function formatOrderDate(timestamp: number) {
@@ -111,7 +112,7 @@
 					<tbody class="divide-y divide-zinc-100 bg-white dark:divide-zinc-800 dark:bg-zinc-950">
 						<tr>
 							<th scope="row" class="px-3 py-2.5 font-medium text-zinc-800 dark:text-zinc-200"
-								>bECX</th
+								>{assetTicker()}</th
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
@@ -124,7 +125,7 @@
 						</tr>
 						<tr>
 							<th scope="row" class="px-3 py-2.5 font-medium text-zinc-800 dark:text-zinc-200"
-								>wbECX</th
+								>{wrappedTicker()}</th
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
@@ -196,11 +197,11 @@
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
-								>{formatUnits(data.stats.wrap_fees_ecx_sat, 8)} bECX</td
+								>{formatUnits(data.stats.wrap_fees_ecx_sat, 8)} {assetTicker()}</td
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
-								>{formatUnits(data.stats.unwrap_fees_wecx_base_units, data.stats.wecx_decimals)} wbECX</td
+								>{formatUnits(data.stats.unwrap_fees_wecx_base_units, data.stats.wecx_decimals)} {wrappedTicker()}</td
 							>
 						</tr>
 						<tr>
@@ -211,11 +212,11 @@
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
-								>{formatUnits(data.stats.fees_paid_ecx_sat, 8)} bECX</td
+								>{formatUnits(data.stats.fees_paid_ecx_sat, 8)} {assetTicker()}</td
 							>
 							<td
 								class="px-3 py-2.5 whitespace-nowrap text-zinc-700 tabular-nums dark:text-zinc-300"
-								>{formatUnits(data.stats.fees_paid_wecx_base_units, data.stats.wecx_decimals)} wbECX</td
+								>{formatUnits(data.stats.fees_paid_wecx_base_units, data.stats.wecx_decimals)} {wrappedTicker()}</td
 							>
 						</tr>
 					</tbody>

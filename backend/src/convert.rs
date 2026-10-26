@@ -46,6 +46,92 @@ pub fn pegin_payout_base_units(
     )
 }
 
+/// SOL has 9 decimals and the native asset has 8, so 10 lamports is 1 sat at a 1:1 coin rate.
+/// Round up so a new token account is never sold for less coin than the SOL it costs.
+pub fn sol_lamports_to_ecx_sat(lamports: u64) -> u64 {
+    lamports.div_ceil(10)
+}
+
+/// How a landed wrap deposit is split between the wrapped payout, a required token-account rent
+/// charge, and an optional SOL stipend. Rent is removed first, then the stipend. Neither is
+/// charged the percentage fee, and neither is turned into wrapped tokens. The stipend is dropped
+/// when what remains would not be a viable wrap. Rent is not: if the deposit cannot cover the
+/// locked rent and still wrap, nothing is paid out and the token account must not be created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledWrap {
+    pub wrap_sat: u64,
+    pub amount_out_base_units: u64,
+    pub sol_stipend_lamports: u64,
+    pub sol_stipend_price_sat: u64,
+    pub ata_rent_lamports: u64,
+    pub ata_rent_price_sat: u64,
+    /// The order locked a new-account rent charge, but this deposit cannot cover it and still wrap.
+    pub ata_rent_uncovered: bool,
+}
+
+pub fn settle_wrap_deposit(
+    actual_sat: u64,
+    offered_lamports: u64,
+    offered_price_sat: u64,
+    wecx_decimals: u8,
+    fee_bps: u64,
+    flat_fee_sat: u64,
+    min_deposit_sat: u64,
+    ata_rent_lamports: u64,
+    ata_rent_price_sat: u64,
+) -> SettledWrap {
+    let settled = |sat: u64, stipend_lamports: u64, stipend_price: u64, rent_lamports: u64, rent_price: u64, uncovered: bool| {
+        SettledWrap {
+            wrap_sat: sat,
+            amount_out_base_units: pegin_payout_base_units(sat, wecx_decimals, fee_bps, flat_fee_sat),
+            sol_stipend_lamports: stipend_lamports,
+            sol_stipend_price_sat: stipend_price,
+            ata_rent_lamports: rent_lamports,
+            ata_rent_price_sat: rent_price,
+            ata_rent_uncovered: uncovered,
+        }
+    };
+    let viable = |sat: u64| {
+        let amount_out = pegin_payout_base_units(sat, wecx_decimals, fee_bps, flat_fee_sat);
+        amount_out > 0 && sat >= min_deposit_sat
+    };
+    // A rent figure with no price would create the account for free. Refuse that rather than guess.
+    if ata_rent_lamports > 0 && ata_rent_price_sat == 0 {
+        return settled(actual_sat, 0, 0, 0, 0, true);
+    }
+
+    let mut base = actual_sat;
+    let mut rent_lamports_charged = 0u64;
+    let mut rent_price_charged = 0u64;
+    if ata_rent_lamports > 0 && ata_rent_price_sat > 0 {
+        if actual_sat <= ata_rent_price_sat {
+            return settled(actual_sat, 0, 0, 0, 0, true);
+        }
+        let after_rent = actual_sat - ata_rent_price_sat;
+        if !viable(after_rent) {
+            return settled(actual_sat, 0, 0, 0, 0, true);
+        }
+        base = after_rent;
+        rent_lamports_charged = ata_rent_lamports;
+        rent_price_charged = ata_rent_price_sat;
+    }
+
+    if offered_lamports > 0 && offered_price_sat > 0 && base > offered_price_sat {
+        let wrap_sat = base - offered_price_sat;
+        if viable(wrap_sat) {
+            return settled(
+                wrap_sat,
+                offered_lamports,
+                offered_price_sat,
+                rent_lamports_charged,
+                rent_price_charged,
+                false,
+            );
+        }
+    }
+    settled(base, 0, 0, rent_lamports_charged, rent_price_charged, false)
+}
+
 /// Smallest deposit that meets `minimum_sat` and still pays out after the flat fee and percentage.
 /// A configured minimum below the flat fee cannot be bridged, so the effective floor rises.
 pub fn minimum_pegin_deposit_sat(
@@ -182,5 +268,107 @@ mod tests {
     fn effective_minimum_covers_the_flat_fee_without_lowering_a_higher_floor() {
         assert_eq!(minimum_pegin_deposit_sat(500, 8, 100, 1_000), 1_002);
         assert_eq!(minimum_pegin_deposit_sat(50_000, 8, 100, 1_000), 50_000);
+    }
+
+    #[test]
+    fn sol_stipend_is_not_converted_into_wrapped_tokens() {
+        let with_sol = settle_wrap_deposit(100_500_000, 5_000_000, 500_000, 8, 100, 1_000, 500, 0, 0);
+        assert_eq!(with_sol.sol_stipend_lamports, 5_000_000);
+        assert_eq!(with_sol.sol_stipend_price_sat, 500_000);
+        assert_eq!(with_sol.wrap_sat, 100_000_000);
+        assert_eq!(
+            with_sol.amount_out_base_units,
+            pegin_payout_base_units(100_000_000, 8, 100, 1_000)
+        );
+    }
+
+    #[test]
+    fn unpaid_sol_stipend_is_not_skimmed_from_a_short_deposit() {
+        let short = settle_wrap_deposit(400_000, 5_000_000, 500_000, 8, 100, 1_000, 500, 0, 0);
+        assert_eq!(short.sol_stipend_lamports, 0);
+        assert_eq!(short.wrap_sat, 400_000);
+        assert_eq!(short.amount_out_base_units, pegin_payout_base_units(400_000, 8, 100, 1_000));
+
+        // Remainder after the stipend price is below the minimum, so the whole deposit wraps.
+        let dust_remainder = settle_wrap_deposit(1_200, 5_000_000, 1_000, 8, 100, 0, 500, 0, 0);
+        assert_eq!(dust_remainder.sol_stipend_lamports, 0);
+        assert_eq!(dust_remainder.wrap_sat, 1_200);
+    }
+
+    #[test]
+    fn token_account_rent_converts_one_to_one_rounding_up() {
+        // Mainnet rent-exempt minimum for a 165-byte SPL token account, in lamports.
+        assert_eq!(sol_lamports_to_ecx_sat(2_039_280), 203_928);
+        assert_eq!(sol_lamports_to_ecx_sat(1), 1);
+        assert_eq!(sol_lamports_to_ecx_sat(0), 0);
+    }
+
+    #[test]
+    fn token_account_rent_is_taken_before_the_stipend_and_is_not_charged_a_fee() {
+        let rent_lamports = 2_039_280u64;
+        let rent_price = sol_lamports_to_ecx_sat(rent_lamports);
+        let wrap = 100_000_000u64;
+        let stipend_price = 500_000u64;
+        let settled = settle_wrap_deposit(
+            wrap + rent_price + stipend_price,
+            5_000_000,
+            stipend_price,
+            8,
+            100,
+            1_000,
+            500,
+            rent_lamports,
+            rent_price,
+        );
+        assert!(!settled.ata_rent_uncovered);
+        assert_eq!(settled.ata_rent_lamports, rent_lamports);
+        assert_eq!(settled.ata_rent_price_sat, rent_price);
+        assert_eq!(settled.sol_stipend_lamports, 5_000_000);
+        assert_eq!(settled.wrap_sat, wrap);
+        assert_eq!(
+            settled.amount_out_base_units,
+            pegin_payout_base_units(wrap, 8, 100, 1_000)
+        );
+    }
+
+    #[test]
+    fn stipend_is_dropped_before_a_required_token_account_charge() {
+        let rent_lamports = 2_039_280u64;
+        let rent_price = 203_928u64;
+        // Enough for the stipend and a viable wrap, but not for rent as well.
+        let settled = settle_wrap_deposit(
+            500_000 + 50_000,
+            5_000_000,
+            500_000,
+            8,
+            100,
+            1_000,
+            500,
+            rent_lamports,
+            rent_price,
+        );
+        assert!(!settled.ata_rent_uncovered);
+        assert_eq!(settled.ata_rent_price_sat, rent_price);
+        assert_eq!(settled.sol_stipend_lamports, 0);
+        assert_eq!(settled.wrap_sat, 550_000 - rent_price);
+    }
+
+    #[test]
+    fn uncovered_token_account_rent_is_not_paid_and_does_not_take_the_stipend() {
+        let settled = settle_wrap_deposit(
+            203_928 + 400,
+            5_000_000,
+            500_000,
+            8,
+            100,
+            1_000,
+            500,
+            2_039_280,
+            203_928,
+        );
+        assert!(settled.ata_rent_uncovered);
+        assert_eq!(settled.ata_rent_lamports, 0);
+        assert_eq!(settled.sol_stipend_lamports, 0);
+        assert_eq!(settled.wrap_sat, 203_928 + 400);
     }
 }

@@ -17,7 +17,7 @@ What that does:
 7. Builds the backend and the frontend through the tunnel, then starts them on localhost. Payouts stay off. The public tunnel stays off.
 8. Prints the ECX deposit address and the Solana treasury address.
 
-Deposit both sides. ECX goes to the `bc1q` address. SOL, for fees, and wECX, for customer unwraps, go to the Solana treasury. Then:
+Deposit both sides. ECX goes to the `bc1q` address. SOL, for fees, token-account rent, and the optional wrap stipend, and wECX, for customer unwraps, go to the Solana treasury. Then:
 
 ```sh
 sudo ./install.sh enable --i-deposited

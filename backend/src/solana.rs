@@ -106,6 +106,29 @@ impl SolanaWallet {
     /// and `parse_pubkey` alone accepts any 32 bytes - including a mangled address, a program id, the
     /// mint, or the treasury itself. Off-curve addresses (PDAs) are rejected unless
     /// `ALLOW_OFF_CURVE_RECIPIENTS` is set - see `config::allow_off_curve_recipients`.
+    /// Lamports this payout must spend to create `recipient`'s token account. `Ok(0)` when that
+    /// account already exists. The figure is the chain's rent-exempt minimum, read once so the
+    /// order can lock a 1:1 native-coin charge. A missing account is not an error; an RPC failure is.
+    pub async fn missing_recipient_ata_rent(&self, recipient: &Pubkey) -> Result<u64> {
+        let ata = get_associated_token_address(recipient, &self.mint);
+        match self.rpc.get_account(&ata).await {
+            Ok(account) => {
+                if account.owner != spl_token::id() {
+                    bail!(
+                        "that address already has an account where the token account must go, and it is not a token account"
+                    );
+                }
+                Ok(0)
+            }
+            Err(e) if account_missing(&e) => self
+                .rpc
+                .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_LEN)
+                .await
+                .context("failed to read token-account rent"),
+            Err(e) => Err(e).context("failed to check recipient token account"),
+        }
+    }
+
     pub fn validate_recipient(&self, recipient: &Pubkey) -> Result<()> {
         let reserved = [
             solana_sdk::system_program::id(),
@@ -115,6 +138,10 @@ impl SolanaWallet {
             self.payer.pubkey(),
         ];
         match recipient_problem(recipient, &reserved, crate::config::allow_off_curve_recipients()) {
+            Some("reserved") => bail!(
+                "that address can't receive {} (it is a program, the mint, or the bridge itself)",
+                crate::config::wrapped_ticker()
+            ),
             Some(problem) => bail!("{problem}"),
             None => Ok(()),
         }
@@ -122,14 +149,21 @@ impl SolanaWallet {
 
     /// Builds and signs (but does not send) the transfer of `amount` (base units, already scaled by
     /// `decimals`) of wECX from the treasury to `recipient`'s associated token account, creating
-    /// that account first if it doesn't exist yet (idempotently). The returned `signature` is
-    /// final: callers persist it *before* `submit`ting, so an ambiguous outcome can always be
-    /// looked up afterwards instead of guessed at.
-    pub async fn prepare_wecx_transfer(&self, recipient: Pubkey, amount: u64) -> Result<PreparedPayout> {
+    /// that account first if it doesn't exist yet (idempotently). `sol_lamports`, when non-zero,
+    /// is a native SOL transfer to the same wallet in the same transaction, so the token and the
+    /// gas stipend land together or not at all. The treasury pays the transaction fee and any
+    /// token-account rent. The returned `signature` is final: callers persist it *before*
+    /// `submit`ting, so an ambiguous outcome can always be looked up afterwards instead of guessed at.
+    pub async fn prepare_wecx_transfer(
+        &self,
+        recipient: Pubkey,
+        amount: u64,
+        sol_lamports: u64,
+    ) -> Result<PreparedPayout> {
         let source_ata = get_associated_token_address(&self.payer.pubkey(), &self.mint);
         let dest_ata = get_associated_token_address(&recipient, &self.mint);
 
-        let instructions = vec![
+        let mut instructions = vec![
             create_associated_token_account_idempotent(
                 &self.payer.pubkey(),
                 &recipient,
@@ -148,6 +182,13 @@ impl SolanaWallet {
             )
             .context("failed to build wECX transfer instruction")?,
         ];
+        if sol_lamports > 0 {
+            instructions.push(solana_sdk::system_instruction::transfer(
+                &self.payer.pubkey(),
+                &recipient,
+                sol_lamports,
+            ));
+        }
 
         let (blockhash, last_valid_block_height) = self
             .rpc
@@ -469,7 +510,7 @@ impl SolanaWallet {
     /// Convenience for the manual CLI path: prepare, submit, and turn anything but a confirmed
     /// transfer into an error. Blocks until the network reports the transaction confirmed.
     pub async fn send_wecx(&self, recipient: Pubkey, amount: u64) -> Result<Signature> {
-        let prepared = self.prepare_wecx_transfer(recipient, amount).await?;
+        let prepared = self.prepare_wecx_transfer(recipient, amount, 0).await?;
         match self.submit(&prepared).await? {
             PayoutOutcome::Confirmed => Ok(prepared.signature),
             PayoutOutcome::Failed(e) => bail!("wECX transfer {} failed on-chain: {e}", prepared.signature),
@@ -599,9 +640,19 @@ pub fn parse_lamports_from_sol(input: &str) -> Result<u64> {
 }
 
 /// Pure core of `SolanaWallet::validate_recipient`: why `recipient` can't be paid, if it can't.
+/// `spl_token::state::Account` is 165 bytes. Rent is read from the chain for that size.
+const TOKEN_ACCOUNT_LEN: usize = 165;
+
+fn account_missing(err: &solana_client::client_error::ClientError) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("could not find account")
+        || text.contains("accountnotfound")
+        || text.contains("account not found")
+}
+
 fn recipient_problem(recipient: &Pubkey, reserved: &[Pubkey], allow_off_curve: bool) -> Option<&'static str> {
     if reserved.contains(recipient) {
-        return Some("that address can't receive wECX (it is a program, the wECX mint, or the bridge itself)");
+        return Some("reserved");
     }
     if !recipient.is_on_curve() && !allow_off_curve {
         return Some(
