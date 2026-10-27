@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Talk to the bridge's local assistant about the bridge's current state.
+
+The assistant is a small language model (Llama 3.2 3B, "Built with Llama") served by llama.cpp on
+this machine only. It is given the status report, recent error lines from the backend journal, and
+the operator runbook, and then answers questions. It has no tools: it cannot run commands or read
+or change anything. Nothing leaves this machine; the model process is denied network access by
+systemd, and the process is stopped when this program exits so the memory is freed.
+
+Run as root (sudo), because the status report needs it. The model itself runs as an unprivileged
+user and only ever sees the text this program sends it.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+INSTALL_SH = "/opt/ecash-bridge/src/install.sh"
+RUNBOOK = "/opt/ecash-bridge/assistant/RUNBOOK.md"
+SERVICE = "ecash-bridge-assistant.service"
+URL = "http://127.0.0.1:3902/v1/chat/completions"
+HEALTH = "http://127.0.0.1:3902/health"
+MAX_LOG_LINES = 60
+
+
+def run(cmd, timeout=120):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (out.stdout + out.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return f"({' '.join(cmd)} timed out)"
+
+
+def status_report():
+    return run([INSTALL_SH, "status"], timeout=90)
+
+
+def recent_errors():
+    text = run(["journalctl", "-u", "ecash-bridge-backend", "-n", "400", "--no-pager", "-o", "short-iso"])
+    markers = ("error", "failed", "denied", "unknown outcome", "below", "insufficient", "mismatch",
+               "[unmatched]", "held", "lost contact", "panicked")
+    lines = [l for l in text.splitlines() if any(m in l.lower() for m in markers)]
+    lines = lines[-MAX_LOG_LINES:]
+    return "\n".join(lines) if lines else "(no error lines in the last 400 backend journal lines)"
+
+
+def ensure_model_running():
+    subprocess.run(["systemctl", "start", SERVICE], check=False)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(HEALTH, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, ConnectionError, OSError):
+            pass
+        if subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode != 0:
+            time.sleep(1)
+            if subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode != 0:
+                print(f"The assistant service did not start. See: journalctl -u {SERVICE} -n 30", file=sys.stderr)
+                return False
+        time.sleep(1)
+    print("The assistant did not answer within two minutes.", file=sys.stderr)
+    return False
+
+
+def stop_model():
+    subprocess.run(["systemctl", "stop", SERVICE], check=False)
+
+
+def stream_answer(messages):
+    body = json.dumps({"messages": messages, "stream": True, "temperature": 0.2, "max_tokens": 700}).encode()
+    req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+    answer = []
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                delta = json.loads(payload)["choices"][0]["delta"].get("content") or ""
+            except (KeyError, IndexError, json.JSONDecodeError):
+                continue
+            if not delta:
+                continue
+            sys.stdout.write(delta)
+            sys.stdout.flush()
+            answer.append(delta)
+    print()
+    return "".join(answer)
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Run with sudo: the status report needs root. The model runs unprivileged.", file=sys.stderr)
+        return 1
+    try:
+        runbook = open(RUNBOOK, encoding="utf-8").read()
+    except OSError as e:
+        print(f"Cannot read the runbook: {e}", file=sys.stderr)
+        return 1
+
+    print("Reading the bridge's status (this takes a few seconds)...")
+    report = status_report()
+    errors = recent_errors()
+    print("Starting the local model...")
+    if not ensure_model_running():
+        return 1
+
+    system = (
+        "You are the operator's assistant for one ECX bridge server. Answer from the status report, "
+        "the recent log lines, and the runbook below. Follow the runbook's rules for the assistant "
+        "exactly.\n\n"
+        "Absolute rule, before everything else: no command on this machine prints a private key or "
+        "seed phrase, and you must never say one does. If the operator shows you a seed phrase or key, "
+        "it is exposed: tell them to make a new wallet and move the funds, and say nothing else about "
+        "the phrase. Do not confirm, repeat, or evaluate it.\n\n# RUNBOOK\n\n" + runbook +
+        "\n\n# STATUS REPORT\n\n" + report +
+        "\n\n# RECENT BACKEND ERROR LINES\n\n" + errors
+    )
+    messages = [{"role": "system", "content": system}]
+
+    print("\nAsk about the bridge. Empty line or Ctrl-D to quit. Type /status to reprint the report.\n")
+    print("The first answer takes a minute while the model reads the report; later ones are faster.\n")
+    try:
+        while True:
+            try:
+                question = input("you> ").strip()
+            except EOFError:
+                break
+            if not question:
+                break
+            if question == "/status":
+                print(report)
+                continue
+            messages.append({"role": "user", "content": question})
+            print("assistant> ", end="", flush=True)
+            try:
+                answer = stream_answer(messages)
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                print(f"\n(the model did not answer: {e})")
+                messages.pop()
+                continue
+            messages.append({"role": "assistant", "content": answer})
+            # Keep the conversation short: the model's context is limited and the report is large.
+            if len(messages) > 13:
+                messages = [messages[0]] + messages[-12:]
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stop_model()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

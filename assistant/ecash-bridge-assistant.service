@@ -1,0 +1,42 @@
+[Unit]
+Description=ECX bridge local assistant model (llama.cpp, Built with Llama), localhost only
+# Started on demand by bridge-assistant and stopped when it exits, so the model occupies memory
+# only while someone is talking to it. Not enabled at boot.
+
+[Service]
+Type=simple
+User=bridgeassist
+Group=bridgeassist
+WorkingDirectory=/opt/ecash-bridge/assistant
+ExecStart=/opt/ecash-bridge/assistant/llama-server --host 127.0.0.1 --port 3902 \
+	--model /opt/ecash-bridge/assistant/model.gguf --ctx-size 8192 --threads 4 \
+	--no-webui --log-disable --alias bridge-assistant
+Restart=no
+# Idle cap: if the CLI died without stopping it, free the memory anyway.
+RuntimeMaxSec=4h
+# The model process may talk only to the loopback interface, and on it only to its own port and
+# the bridge-assistant CLI that connects to it: the bridge's own API ports are denied too, so a
+# prompt cannot make the model read or create orders. It cannot reach the internet, the VPN, or
+# the LAN. SocketBindDeny/Allow pins the port it may listen on.
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1
+SocketBindDeny=any
+SocketBindAllow=tcp:3902
+RestrictAddressFamilies=AF_INET AF_UNIX
+# Outbound connections from the model process are not needed at all; llama-server only answers.
+# The address allow-list above is the one systemd offers; the firewall below closes the rest.
+RestrictNetworkInterfaces=lo
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadOnlyPaths=/opt/ecash-bridge/assistant
