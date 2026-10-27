@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bdk_wallet::bitcoin::{Address, Amount, OutPoint};
+use bdk_wallet::bitcoin::{Address, Amount, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
 use solana_sdk::signature::{Keypair, Signer};
 use tokio::net::TcpListener;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::config::{self, ChainConfig};
-use crate::db::{OrderStatus, PegoutOrderStatus};
+use crate::db::{OrderStatus, PegoutOrderStatus, UnmatchedStatus};
 use crate::solana::SolanaWallet;
 use crate::wallet::ChainWallet;
 use crate::{convert, db, solana};
@@ -38,8 +38,14 @@ struct Limits {
 }
 
 impl Limits {
-    /// Sliding one-minute window over successful admissions. Returns `false` when the window is full.
+    /// Sliding one-minute window over successful admissions. Returns `false` when the window is
+    /// full. A configured limit of `0` means no limit (see `config::max_orders_per_minute`); it
+    /// must not be read as "admit nothing", which would refuse every customer.
     fn allow_order_creation(&self) -> bool {
+        let limit = config::max_orders_per_minute();
+        if limit == 0 {
+            return true;
+        }
         let mut window = self.order_creations.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         while window
@@ -48,7 +54,7 @@ impl Limits {
         {
             window.pop_front();
         }
-        if window.len() as u64 >= config::max_orders_per_minute() {
+        if window.len() as u64 >= limit {
             return false;
         }
         window.push_back(now);
@@ -133,6 +139,16 @@ struct QuoteResponse {
     sol_stipend_price_sat: u64,
     /// Display-only estimate, such as "0.50". Empty when the operator did not set a usable label.
     sol_stipend_usd_label: String,
+    /// Minutes a new order waits for its deposit before it expires (see `config::order_max_age`).
+    /// A deposit that lands later is still credited; this is the window to show the customer.
+    order_lifetime_minutes: u64,
+    /// Blocks an ECX deposit needs before it is paid out (see `config::deposit_min_confs`), so the
+    /// order page can show "n of m confirmations".
+    required_confirmations: u32,
+    /// Block explorer the frontend links transaction ids to, without a trailing slash. Empty when
+    /// the operator turned the links off.
+    ecx_explorer_tx_url: String,
+    solana_explorer_tx_url: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -149,6 +165,10 @@ struct StatsResponse {
     unwrap_fees_wecx_base_units: String,
     fees_paid_ecx_sat: String,
     fees_paid_wecx_base_units: String,
+    /// Reference-less wECX deposits: waiting for a person, owed back, and already returned.
+    unmatched_deposits_held: u64,
+    unmatched_refunds_pending: u64,
+    unmatched_refunds_completed: u64,
     recent_orders: Vec<RecentOrderResponse>,
     updated_at_unix: u64,
 }
@@ -189,6 +209,10 @@ async fn get_stats(
     let (fees_paid_ecx_sat, fees_paid_wecx_base_units) = db::paid_earnings(&state.db)
         .await
         .map_err(internal_error)?;
+    let (unmatched_held, unmatched_pending, unmatched_refunded) = db::unmatched_deposit_counts(&state.db)
+        .await
+        .map_err(internal_error)?;
+    let unmatched_fees = db::unmatched_deposit_fees(&state.db).await.map_err(internal_error)?;
 
     let wrap_fees_sat: u128 = wraps
         .iter()
@@ -205,6 +229,7 @@ async fn get_stats(
                 convert::ecx_sat_to_wecx_base_units(*amount_out_sat, decimals, 0);
             amount_in_base_units.saturating_sub(amount_out_base_units) as u128
         })
+        .chain(unmatched_fees.iter().map(|(fee, _)| *fee as u128))
         .sum();
 
     let mut ecx = state.ecx.lock().await;
@@ -239,6 +264,9 @@ async fn get_stats(
         unwrap_fees_wecx_base_units: unwrap_fees_base_units.to_string(),
         fees_paid_ecx_sat: fees_paid_ecx_sat.to_string(),
         fees_paid_wecx_base_units: fees_paid_wecx_base_units.to_string(),
+        unmatched_deposits_held: unmatched_held,
+        unmatched_refunds_pending: unmatched_pending,
+        unmatched_refunds_completed: unmatched_refunded,
         recent_orders: recent_orders
             .into_iter()
             .map(|order| RecentOrderResponse {
@@ -283,6 +311,10 @@ async fn get_quote(State(state): State<Arc<AppState>>, Query(query): Query<Quote
         sol_stipend_lamports: stipend.lamports,
         sol_stipend_price_sat: stipend.price_sat,
         sol_stipend_usd_label: stipend.usd_label,
+        order_lifetime_minutes: config::order_lifetime_minutes(),
+        required_confirmations: config::deposit_min_confs(),
+        ecx_explorer_tx_url: config::ecx_explorer_tx_url(),
+        solana_explorer_tx_url: config::solana_explorer_tx_url(),
     })
 }
 
@@ -623,10 +655,14 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
     let actual_amount_in = Amount::from_sat(actual_sat);
 
     let settled = settle_order_deposit(&order, actual_amount_in.to_sat(), state.solana.decimals());
+    // Confirmations are recorded too, so the order page can show progress; past the required count
+    // the exact number no longer matters and is not a reason to write.
+    let confirmations_changed = confs < min_confs && i64::from(confs) != order.deposit_confirmations;
     if new_status.label() == order.status
         && order.deposit_txid.as_deref() == Some(deposit_txid.as_str())
         && actual_amount_in.to_sat() as i64 == order.amount_in_sat
         && settled.amount_out_base_units as i64 == order.amount_out_base_units
+        && !confirmations_changed
     {
         return Ok(order);
     }
@@ -644,6 +680,7 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
         &deposit_txid,
         actual_amount_in,
         amount_out,
+        confs.min(min_confs),
     )
     .await?
     {
@@ -659,6 +696,7 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
         deposit_txid: Some(deposit_txid),
         amount_in_sat: actual_amount_in.to_sat() as i64,
         amount_out_base_units: amount_out as i64,
+        deposit_confirmations: i64::from(confs.min(min_confs)),
         ..order
     };
 
@@ -666,17 +704,29 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
         && (settled.ata_rent_uncovered || !payout_viable(settled.wrap_sat, amount_out))
         && updated.refund_address.is_some()
     {
+        let reason = wrap_refund_reason(&settled, amount_out);
         eprintln!(
-            "[detect_deposit] order {}: deposit cannot cover a new token account, is below the \
-             minimum, or reprices to zero wECX -> requesting refund",
+            "[detect_deposit] order {}: {reason} -> requesting refund",
             short(&updated.id)
         );
-        if db::request_refund(&state.db, &updated.id).await? {
+        if db::request_refund(&state.db, &updated.id, reason).await? {
             updated.status = OrderStatus::RefundRequested.label().to_string();
+            updated.refund_reason = reason.to_string();
         }
     }
 
     Ok(updated)
+}
+
+/// Why a landed wrap deposit is being sent back, in words for the customer.
+fn wrap_refund_reason(settled: &convert::SettledWrap, amount_out: u64) -> &'static str {
+    if settled.ata_rent_uncovered {
+        "the deposit was too small to cover creating the token account for your Solana address"
+    } else if amount_out == 0 {
+        "after fees the deposit would wrap to nothing"
+    } else {
+        "the deposit was below the minimum amount"
+    }
 }
 
 /// Whether a landed deposit is worth paying out: at least the minimum deposit (checked against what
@@ -789,9 +839,11 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
              paying out",
             short(&order.id)
         );
-        if order.refund_address.is_some() && db::request_refund(&state.db, &order.id).await? {
+        let reason = wrap_refund_reason(&settled, settled.amount_out_base_units);
+        if order.refund_address.is_some() && db::request_refund(&state.db, &order.id, reason).await? {
             return Ok(db::Order {
                 status: OrderStatus::RefundRequested.label().to_string(),
+                refund_reason: reason.to_string(),
                 ..order
             });
         }
@@ -1586,7 +1638,14 @@ async fn get_order(
     // the ECX wallet lock over a network call, and this endpoint is unauthenticated.
     let fallback = order.clone();
     let sync = state.limits.allow_get_sync();
-    let order = check_deposit(&state, order, sync).await.unwrap_or(fallback);
+    // An expired order the customer is still looking at is the likeliest place for a late deposit
+    // to be noticed: `detect_deposit` ignores expired orders, and the poller's revival pass only
+    // covers the most recently expired ones.
+    let order = if order.status == OrderStatus::Expired.label() && within_expiry_grace(order.updated_at) {
+        revive_wrap_if_funded(&state, order, sync).await.unwrap_or(fallback)
+    } else {
+        check_deposit(&state, order, sync).await.unwrap_or(fallback)
+    };
 
     Ok(Json(order))
 }
@@ -1691,6 +1750,16 @@ struct PegoutQuoteResponse {
     /// Static, so it's served from the quote endpoint rather than repeated on every order.
     treasury_pubkey: String,
     wecx_mint: String,
+    /// Same meaning as `QuoteResponse::order_lifetime_minutes`.
+    order_lifetime_minutes: u64,
+    /// What happens to a transfer that reaches the treasury without this order's reference key:
+    /// sent back to the wallet it came from minus this fee, when refunds are on and the sender is
+    /// an ordinary wallet. Shown to the customer before they pay.
+    unmatched_deposit_fee_bps: u64,
+    unmatched_deposit_refunds: bool,
+    /// Same meaning as the fields on `QuoteResponse`.
+    ecx_explorer_tx_url: String,
+    solana_explorer_tx_url: String,
 }
 
 async fn get_pegout_quote(
@@ -1711,6 +1780,11 @@ async fn get_pegout_quote(
         min_amount_out_sat: config::min_deposit_amount().to_sat(),
         treasury_pubkey: state.solana.pubkey().to_string(),
         wecx_mint: state.solana.mint().to_string(),
+        order_lifetime_minutes: config::order_lifetime_minutes(),
+        unmatched_deposit_fee_bps: config::unmatched_deposit_fee_bps(),
+        unmatched_deposit_refunds: config::unmatched_deposit_refunds_enabled(),
+        ecx_explorer_tx_url: config::ecx_explorer_tx_url(),
+        solana_explorer_tx_url: config::solana_explorer_tx_url(),
     })
 }
 
@@ -1841,10 +1915,14 @@ async fn get_pegout_order(
     };
 
     // Best-effort, rate-limited the same way `get_order` rate-limits its ECX sync - see
-    // `Limits::allow_get_sync`.
+    // `Limits::allow_get_sync`. Expired orders take the revival path for the same reason as there.
     let fallback = order.clone();
     let sync = state.limits.allow_get_sync();
-    let order = check_pegout_deposit(&state, order, sync).await.unwrap_or(fallback);
+    let order = if order.status == PegoutOrderStatus::Expired.label() && within_expiry_grace(order.updated_at) {
+        revive_pegout_if_funded(&state, order, sync).await.unwrap_or(fallback)
+    } else {
+        check_pegout_deposit(&state, order, sync).await.unwrap_or(fallback)
+    };
 
     Ok(Json(order))
 }
@@ -1867,7 +1945,312 @@ async fn run_order_poller(state: Arc<AppState>) {
         if let Err(e) = poll_pegout_orders_once(&state).await {
             eprintln!("pegout order poll failed: {e:#}");
         }
+        // After the peg-out pass, so a deposit that does carry a reference has been attributed to
+        // its order before the treasury-wide scan looks at the same transaction.
+        if let Err(e) = scan_unmatched_deposits_once(&state).await {
+            eprintln!("[unmatched] scan failed: {e:#}");
+        }
+        if let Err(e) = refund_unmatched_deposits_once(&state).await {
+            eprintln!("[unmatched] refund pass failed: {e:#}");
+        }
     }
+}
+
+const UNMATCHED_SCAN_CURSOR: &str = "treasury_deposits";
+/// Transactions examined per tick. Each costs one RPC fetch; the rest wait for the next tick.
+const UNMATCHED_SCAN_PER_TICK: usize = 25;
+const UNMATCHED_REFUNDS_PER_TICK: u64 = 10;
+
+/// What to do with a wECX deposit that no order can claim. Pure, so the rules are testable.
+#[derive(Debug, PartialEq, Eq)]
+struct UnmatchedDecision {
+    status: UnmatchedStatus,
+    fee_base_units: u64,
+    refund_base_units: u64,
+    note: &'static str,
+}
+
+struct UnmatchedFacts<'a> {
+    amount_base_units: u64,
+    depositor_owner: Option<&'a str>,
+    /// `depositor_owner` is a wallet that can be paid (on-curve, not a program, mint, or the
+    /// treasury) - the result of `SolanaWallet::validate_recipient`.
+    depositor_payable: bool,
+    depositor_is_funding_wallet: bool,
+    live_payouts: bool,
+    refunds_enabled: bool,
+    fee_bps: u64,
+    /// Smallest refund worth sending, in wECX base units.
+    min_refund_base_units: u64,
+}
+
+fn decide_unmatched(facts: &UnmatchedFacts<'_>) -> UnmatchedDecision {
+    let held = |note| UnmatchedDecision {
+        status: UnmatchedStatus::Held,
+        fee_base_units: 0,
+        refund_base_units: 0,
+        note,
+    };
+    if facts.depositor_is_funding_wallet {
+        // The operator adding liquidity. Not a fee, not a refund.
+        return UnmatchedDecision {
+            status: UnmatchedStatus::Kept,
+            fee_base_units: 0,
+            refund_base_units: 0,
+            note: "treasury funding from an operator wallet",
+        };
+    }
+    if facts.depositor_owner.is_none() {
+        return held("the sending wallet could not be determined from the transaction");
+    }
+    if !facts.depositor_payable {
+        return held("the sending account is a program or the bridge itself, not a wallet a refund can go to");
+    }
+    if !facts.live_payouts {
+        // Before `enable`, nothing public exists, so this is almost certainly the operator's own
+        // funding from a wallet other than the owner address. During a later pause it may be a
+        // customer. Either way a person decides; nothing is sent while payouts are off.
+        return held("received while payouts were off; review, then refund by hand if it is a customer's");
+    }
+    if !facts.refunds_enabled {
+        return held("automatic refunds are disabled (UNMATCHED_DEPOSIT_REFUNDS)");
+    }
+    let (fee, refund) = convert::unmatched_refund_split(facts.amount_base_units, facts.fee_bps);
+    if refund == 0 || refund < facts.min_refund_base_units {
+        return UnmatchedDecision {
+            status: UnmatchedStatus::Kept,
+            fee_base_units: facts.amount_base_units,
+            refund_base_units: 0,
+            note: "below the minimum refund; kept as the fee",
+        };
+    }
+    UnmatchedDecision {
+        status: UnmatchedStatus::Pending,
+        fee_base_units: fee,
+        refund_base_units: refund,
+        note: "no order reference in the transaction",
+    }
+}
+
+/// Walks the treasury token account's history forward from where the last tick stopped and
+/// records every finalized wECX deposit that no order can claim - a transfer made by pasting the
+/// treasury address into a wallet instead of opening the order's Solana Pay link, so it carries no
+/// reference key. Left alone, such a deposit quietly becomes float and is paid out to wrap
+/// customers while its sender waits for an order that will never advance.
+///
+/// Only finalized transactions are examined, and the cursor only ever points at one, so a dropped
+/// fork can never leave it pointing at a signature the RPC no longer knows. On the first run the
+/// cursor is set to the newest finalized signature and nothing older is examined: the history
+/// before this feature existed may contain deposits the operator already dealt with by hand.
+async fn scan_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> {
+    let _money_operation = state.money_operations.lock().await;
+    let cursor = db::scan_cursor(&state.db, UNMATCHED_SCAN_CURSOR).await?;
+    let cursor_signature = cursor
+        .as_deref()
+        .map(|value| value.parse::<solana_sdk::signature::Signature>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("stored treasury scan cursor is invalid: {e}"))?;
+
+    let listing = state.solana.list_treasury_signatures(cursor_signature.as_ref()).await?;
+    if cursor.is_none() {
+        if let Some(newest) = listing.entries.iter().rev().find(|entry| entry.finalized) {
+            db::set_scan_cursor(&state.db, UNMATCHED_SCAN_CURSOR, &newest.signature.to_string()).await?;
+            eprintln!(
+                "[unmatched] treasury deposit scanning starts after {}; earlier deposits are not examined",
+                newest.signature
+            );
+        }
+        return Ok(());
+    }
+    if listing.entries.is_empty() {
+        return Ok(());
+    }
+    if !listing.complete {
+        eprintln!(
+            "[unmatched] the treasury had more transactions since the last scan than one pass reads; \
+             transactions older than {} were skipped and need a manual look",
+            listing.entries[0].signature
+        );
+    }
+
+    let references = db::pegout_reference_pubkeys(&state.db).await?;
+    let mut funding: HashSet<String> = config::treasury_funding_addresses().into_iter().collect();
+    if let Some(settings) = state.earnings.as_ref() {
+        funding.insert(settings.solana_owner_address.clone());
+    }
+    let live_payouts = config::live_payouts_allowed();
+    let refunds_enabled = config::unmatched_deposit_refunds_enabled();
+    let fee_bps = config::unmatched_deposit_fee_bps();
+    let min_refund_base_units = convert::ecx_sat_to_wecx_base_units(
+        config::min_deposit_amount().to_sat(),
+        state.solana.decimals(),
+        0,
+    );
+
+    for (examined, entry) in listing.entries.iter().enumerate() {
+        if !entry.finalized || examined >= UNMATCHED_SCAN_PER_TICK {
+            // Everything from here on is newer. It waits for the next tick, and the cursor stays
+            // on the last finalized transaction that was examined.
+            break;
+        }
+        let signature = entry.signature.to_string();
+        // A failed transaction moved nothing, so there is nothing to fetch.
+        let deposit = if entry.failed { None } else { state.solana.fetch_treasury_deposit(&entry.signature, true).await? };
+        if let Some(deposit) = deposit {
+            let belongs_to_an_order = db::is_pegout_deposit_signature(&state.db, &signature).await?
+                || deposit.account_keys.iter().any(|key| references.contains(key));
+            if !belongs_to_an_order {
+                let owner = deposit.depositor_owner.map(|pk| pk.to_string());
+                let facts = UnmatchedFacts {
+                    amount_base_units: deposit.amount_base_units,
+                    depositor_owner: owner.as_deref(),
+                    depositor_payable: deposit
+                        .depositor_owner
+                        .is_some_and(|pk| state.solana.validate_recipient(&pk).is_ok()),
+                    depositor_is_funding_wallet: owner.as_deref().is_some_and(|o| funding.contains(o)),
+                    live_payouts,
+                    refunds_enabled,
+                    fee_bps,
+                    min_refund_base_units,
+                };
+                let decision = decide_unmatched(&facts);
+                let inserted = db::insert_unmatched_deposit(
+                    &state.db,
+                    &db::NewUnmatchedDeposit {
+                        signature: &signature,
+                        amount_base_units: deposit.amount_base_units,
+                        depositor_owner: owner.as_deref(),
+                        fee_base_units: decision.fee_base_units,
+                        refund_base_units: decision.refund_base_units,
+                        status: decision.status,
+                        note: decision.note,
+                    },
+                )
+                .await?;
+                if inserted {
+                    eprintln!(
+                        "[unmatched] deposit {signature}: {} base units from {} -> {} ({})",
+                        deposit.amount_base_units,
+                        owner.as_deref().unwrap_or("unknown"),
+                        decision.status.label(),
+                        decision.note
+                    );
+                }
+            }
+        }
+        db::set_scan_cursor(&state.db, UNMATCHED_SCAN_CURSOR, &signature).await?;
+    }
+    Ok(())
+}
+
+/// Sends the refunds recorded by `scan_unmatched_deposits_once`, and settles attempts that did not
+/// finish cleanly. Same two-phase pattern as `try_refund_pegout`: claim, sign, persist the
+/// signature, broadcast, and leave an ambiguous outcome `refunding` for the next pass to look up
+/// rather than retrying blind.
+async fn refund_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> {
+    let _money_operation = state.money_operations.lock().await;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    for deposit in db::list_unmatched_deposits(&state.db, &[UnmatchedStatus::Refunding], 50).await? {
+        if now - deposit.updated_at < PAYOUT_RESOLVE_AFTER_SECS {
+            continue;
+        }
+        let Some(refund_signature) = deposit.refund_signature.as_deref() else {
+            eprintln!("[unmatched] deposit {}: refunding with no signature on file - nothing was sent, reverting", deposit.signature);
+            db::revert_unmatched_refund_claim(&state.db, &deposit.signature).await?;
+            continue;
+        };
+        let parsed: solana_sdk::signature::Signature = refund_signature
+            .parse()
+            .map_err(|e| anyhow::anyhow!("stored refund signature {refund_signature:?} is invalid: {e}"))?;
+        match state.solana.signature_outcome(&parsed).await? {
+            solana::SignatureOutcome::Confirmed => {
+                eprintln!("[unmatched] deposit {}: refund {refund_signature} did land - marking refunded", deposit.signature);
+                db::finish_unmatched_refund(&state.db, &deposit.signature, refund_signature).await?;
+            }
+            solana::SignatureOutcome::Failed(reason) => {
+                eprintln!("[unmatched] deposit {}: refund {refund_signature} failed on-chain ({reason}) - reverting for retry", deposit.signature);
+                db::revert_unmatched_refund_claim(&state.db, &deposit.signature).await?;
+            }
+            solana::SignatureOutcome::NotFound => {
+                eprintln!("[unmatched] deposit {}: refund {refund_signature} never landed and no longer can - reverting for retry", deposit.signature);
+                db::revert_unmatched_refund_claim(&state.db, &deposit.signature).await?;
+            }
+            solana::SignatureOutcome::Pending => {}
+        }
+    }
+
+    if !config::live_payouts_allowed() || !config::unmatched_deposit_refunds_enabled() {
+        return Ok(());
+    }
+    let pending = db::list_unmatched_deposits(&state.db, &[UnmatchedStatus::Pending], UNMATCHED_REFUNDS_PER_TICK).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let sol_lamports = state.solana.sol_balance_lamports().await?;
+    if sol_lamports < config::treasury_min_sol_lamports() {
+        eprintln!(
+            "[unmatched] treasury SOL balance {sol_lamports} lamports is below TREASURY_MIN_SOL_LAMPORTS - \
+             {} refund(s) held, top the treasury up",
+            pending.len()
+        );
+        return Ok(());
+    }
+
+    for deposit in pending {
+        let signature = deposit.signature.clone();
+        let Some(owner) = deposit.depositor_owner.as_deref() else {
+            db::hold_unmatched_deposit(&state.db, &signature, "the sending wallet is not on file").await?;
+            continue;
+        };
+        let recipient = match solana::parse_pubkey(owner).and_then(|pk| state.solana.validate_recipient(&pk).map(|()| pk)) {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("[unmatched] deposit {signature}: sender {owner} cannot be refunded ({e}) - holding");
+                db::hold_unmatched_deposit(&state.db, &signature, "the sending wallet cannot receive a refund").await?;
+                continue;
+            }
+        };
+        if !db::claim_unmatched_refund(&state.db, &signature).await? {
+            continue;
+        }
+        eprintln!(
+            "[unmatched] deposit {signature}: refunding {} base units to {owner} (fee {} kept)",
+            deposit.refund_base_units, deposit.fee_base_units
+        );
+        let prepared = match state.solana.prepare_wecx_transfer(recipient, deposit.refund_base_units, 0).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[unmatched] deposit {signature}: refund could not be prepared: {e:#}");
+                db::revert_unmatched_refund_claim(&state.db, &signature).await?;
+                continue;
+            }
+        };
+        let refund_signature = prepared.signature.to_string();
+        if let Err(e) = db::record_unmatched_refund_signature(&state.db, &signature, &refund_signature).await {
+            eprintln!("[unmatched] deposit {signature}: could not record refund signature: {e:#}");
+            db::revert_unmatched_refund_claim(&state.db, &signature).await?;
+            continue;
+        }
+        match state.solana.submit(&prepared).await {
+            Ok(solana::PayoutOutcome::Confirmed) => {
+                db::finish_unmatched_refund(&state.db, &signature, &refund_signature).await?;
+                eprintln!("[unmatched] deposit {signature}: refunded, {refund_signature}");
+            }
+            Ok(solana::PayoutOutcome::Failed(reason)) => {
+                eprintln!("[unmatched] deposit {signature}: refund {refund_signature} failed on-chain ({reason}) - will retry");
+                db::revert_unmatched_refund_claim(&state.db, &signature).await?;
+            }
+            Ok(solana::PayoutOutcome::Expired) => {
+                eprintln!("[unmatched] deposit {signature}: refund {refund_signature} expired unconfirmed - will retry");
+                db::revert_unmatched_refund_claim(&state.db, &signature).await?;
+            }
+            Err(e) => {
+                eprintln!("[unmatched] deposit {signature}: refund {refund_signature} has an UNKNOWN outcome: {e:#} - left refunding for resolution");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_sweep_transaction(hex: &str) -> anyhow::Result<bdk_wallet::bitcoin::Transaction> {
@@ -1915,9 +2298,12 @@ async fn sweep_earnings_once(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     };
     let (wecx_threshold, ecx_threshold) = settings.thresholds(state.solana.decimals())?;
+    // Fees kept from reference-less deposits are unwrap-side earnings, recorded as (fee, 0).
+    let mut unwrap_amounts = db::completed_unwrap_amounts(&state.db).await?;
+    unwrap_amounts.extend(db::unmatched_deposit_fees(&state.db).await?);
     for (asset, threshold, amounts) in [
         ("becx", ecx_threshold, db::completed_wrap_amounts(&state.db).await?),
-        ("wbecx", wecx_threshold, db::completed_unwrap_amounts(&state.db).await?),
+        ("wbecx", wecx_threshold, unwrap_amounts),
     ] {
         if db::pending_earnings_sweeps(&state.db).await?.iter().any(|sweep| sweep.asset == asset) {
             continue;
@@ -2064,7 +2450,7 @@ async fn poll_orders_once(state: &AppState) -> anyhow::Result<()> {
             scripts.push(addr.assume_checked().script_pubkey());
         }
     }
-    if let Err(e) = state.ecx.lock().await.sync_addresses(scripts).await {
+    if let Err(e) = sync_scripts_in_chunks(state, scripts).await {
         eprintln!("[poll] ecx sync failed: {e:#}");
     }
 
@@ -2100,6 +2486,74 @@ async fn poll_orders_once(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Syncs `scripts` against the explorer in chunks, taking the wallet lock per chunk instead of for
+/// the whole batch. A chunk is a couple of seconds of Esplora requests. Holding the lock across a
+/// full set of `config::max_pending_orders` addresses would stall every `create_order`, which
+/// needs the lock for a fresh address and holds `money_operations` while it waits, and with it
+/// every other order request, for the length of the tick's sync. Stops at the first failed chunk:
+/// an explorer that is down would otherwise time out once per chunk.
+async fn sync_scripts_in_chunks(state: &AppState, scripts: Vec<ScriptBuf>) -> anyhow::Result<()> {
+    const CHUNK: usize = 50;
+    for chunk in scripts.chunks(CHUNK) {
+        state.ecx.lock().await.sync_addresses(chunk.to_vec()).await?;
+    }
+    Ok(())
+}
+
+/// Whether an order that expired at `updated_at` is still inside `config::expiry_grace`, the
+/// window in which a late deposit revives it.
+fn within_expiry_grace(updated_at: i64) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    updated_at >= now.saturating_sub(config::expiry_grace().as_secs() as i64)
+}
+
+/// Puts an expired wrap order back in play if its deposit address has since been paid. With
+/// `sync`, the address is re-checked against the explorer first; without it, only what earlier
+/// syncs already recorded counts. Returns the order as it stands afterwards: revived and advanced
+/// through `check_deposit`, or unchanged. Used by the poller's revival pass and by `get_order`, so
+/// a customer who paid after the 15-minute window and is looking at the "expired" page is served
+/// as soon as the deposit shows up, not only if their order is among the ones the poller re-checks.
+async fn revive_wrap_if_funded(state: &AppState, order: db::Order, sync: bool) -> anyhow::Result<db::Order> {
+    let script = order.deposit_address.parse::<Address<_>>()?.assume_checked().script_pubkey();
+    let mut wallet = state.ecx.lock().await;
+    if sync {
+        wallet.sync_addresses([script.clone()]).await?;
+    }
+    let funded = wallet.outputs().into_iter().any(|output| output.txout.script_pubkey == script);
+    drop(wallet);
+    if !funded || !db::revive_expired_order(&state.db, &order.id).await? {
+        return Ok(order);
+    }
+    let Some(revived) = db::get_order(&state.db, &order.id).await? else {
+        return Ok(order);
+    };
+    check_deposit(state, revived, false).await
+}
+
+/// Peg-out mirror of `revive_wrap_if_funded`. The reference-key lookup is the sync itself, so
+/// without `sync` there is nothing to consult and the order is returned unchanged.
+async fn revive_pegout_if_funded(
+    state: &AppState,
+    order: db::PegoutOrder,
+    sync: bool,
+) -> anyhow::Result<db::PegoutOrder> {
+    if !sync {
+        return Ok(order);
+    }
+    let reference = solana::parse_pubkey(&order.reference_pubkey)?;
+    let found = state
+        .solana
+        .find_reference_deposit(&reference, order.amount_in_base_units as u64)
+        .await?;
+    if found.is_none() || !db::revive_expired_pegout_order(&state.db, &order.id).await? {
+        return Ok(order);
+    }
+    let Some(revived) = db::get_pegout_order(&state.db, &order.id).await? else {
+        return Ok(order);
+    };
+    check_pegout_deposit(state, revived, true).await
+}
+
 async fn revive_late_wraps(state: &AppState) -> anyhow::Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let since = now.saturating_sub(config::expiry_grace().as_secs() as i64);
@@ -2112,31 +2566,14 @@ async fn revive_late_wraps(state: &AppState) -> anyhow::Result<()> {
         .filter_map(|order| order.deposit_address.parse::<Address<_>>().ok())
         .map(|address| address.assume_checked().script_pubkey())
         .collect();
-    if let Err(e) = state.ecx.lock().await.sync_addresses(scripts).await {
+    if let Err(e) = sync_scripts_in_chunks(state, scripts).await {
         eprintln!("[poll] late-deposit sync failed: {e:#}");
         return Ok(());
     }
     for order in expired {
         let id = order.id.clone();
-        let script = match order.deposit_address.parse::<Address<_>>() {
-            Ok(address) => address.assume_checked().script_pubkey(),
-            Err(e) => {
-                eprintln!("[poll] expired order {} has an invalid deposit address: {e}", short(&id));
-                continue;
-            }
-        };
-        let has_output = state.ecx.lock().await.outputs().into_iter().any(|output| output.txout.script_pubkey == script);
-        if !has_output {
-            continue;
-        }
-        if !db::revive_expired_order(&state.db, &id).await? {
-            continue;
-        }
-        let Some(revived) = db::get_order(&state.db, &id).await? else {
-            continue;
-        };
-        if let Err(e) = check_deposit(state, revived, false).await {
-            eprintln!("[poll] revived order {} could not be checked: {e:#}", short(&id));
+        if let Err(e) = revive_wrap_if_funded(state, order, false).await {
+            eprintln!("[poll] expired order {} could not be revived: {e:#}", short(&id));
         }
     }
     Ok(())
@@ -2146,28 +2583,9 @@ async fn revive_late_pegouts(state: &AppState) -> anyhow::Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let since = now.saturating_sub(config::expiry_grace().as_secs() as i64);
     for order in db::list_expired_pegout_orders_since(&state.db, since, 50).await? {
-        let reference = match solana::parse_pubkey(&order.reference_pubkey) {
-            Ok(reference) => reference,
-            Err(e) => {
-                eprintln!("[poll] expired pegout {} has an invalid reference: {e}", short(&order.id));
-                continue;
-            }
-        };
-        let found = state
-            .solana
-            .find_reference_deposit(&reference, order.amount_in_base_units as u64)
-            .await?;
-        if found.is_none() {
-            continue;
-        }
-        if !db::revive_expired_pegout_order(&state.db, &order.id).await? {
-            continue;
-        }
-        let Some(revived) = db::get_pegout_order(&state.db, &order.id).await? else {
-            continue;
-        };
-        if let Err(e) = check_pegout_deposit(state, revived, true).await {
-            eprintln!("[poll] revived pegout {} could not be checked: {e:#}", short(&order.id));
+        let id = order.id.clone();
+        if let Err(e) = revive_pegout_if_funded(state, order, true).await {
+            eprintln!("[poll] expired pegout {} could not be revived: {e:#}", short(&id));
         }
     }
     Ok(())
@@ -2186,6 +2604,17 @@ pub async fn serve(
         anyhow::ensure!(solana.decimals() == 8, "earnings sweeps currently require an 8-decimal wbECX mint");
         settings.thresholds(solana.decimals())?;
         solana.validate_recipient(&solana::parse_pubkey(&settings.solana_owner_address)?)?;
+        // The Solana side is covered by `validate_recipient` (the treasury is a reserved
+        // recipient). The ECX side needs a derivation check: an owner address taken from the hot
+        // wallet would record fees as swept while they never left this machine.
+        let ecx_owner = settings
+            .ecx_owner_address
+            .parse::<Address<_>>()?
+            .require_network(ChainConfig::ecx().network)?;
+        anyhow::ensure!(
+            !ecx.owns_address(&ecx_owner),
+            "ecx_owner_address {ecx_owner} belongs to this hot wallet; use a cold wallet on a different seed"
+        );
     }
     let state = Arc::new(AppState {
         ecx: Mutex::new(ecx),
@@ -2241,6 +2670,10 @@ mod tests {
         assert!(limits.allow_order_creation());
         assert!(!limits.allow_order_creation());
         unsafe {
+            std::env::set_var("ORDERS_PER_MINUTE", "0");
+        }
+        assert!(limits.allow_order_creation(), "0 must disable the limit, not refuse every order");
+        unsafe {
             std::env::remove_var("ORDERS_PER_MINUTE");
         }
     }
@@ -2271,5 +2704,44 @@ mod tests {
     fn short_ids_never_panic_on_short_input() {
         assert_eq!(short("abc"), "abc");
         assert_eq!(short("0123456789abcdef"), "01234567");
+    }
+
+    #[test]
+    fn unmatched_deposit_rules_never_send_to_the_wrong_place() {
+        let base = UnmatchedFacts {
+            amount_base_units: 10_000,
+            depositor_owner: Some("wallet"),
+            depositor_payable: true,
+            depositor_is_funding_wallet: false,
+            live_payouts: true,
+            refunds_enabled: true,
+            fee_bps: 100,
+            min_refund_base_units: 50,
+        };
+        let refund = decide_unmatched(&base);
+        assert_eq!(
+            (refund.status, refund.fee_base_units, refund.refund_base_units),
+            (UnmatchedStatus::Pending, 100, 9_900)
+        );
+
+        let funding = decide_unmatched(&UnmatchedFacts { depositor_is_funding_wallet: true, ..base });
+        assert_eq!((funding.status, funding.fee_base_units, funding.refund_base_units), (UnmatchedStatus::Kept, 0, 0),
+            "the operator's own liquidity is neither refunded nor charged");
+
+        for facts in [
+            UnmatchedFacts { depositor_owner: None, ..base },
+            UnmatchedFacts { depositor_payable: false, ..base },
+            UnmatchedFacts { live_payouts: false, ..base },
+            UnmatchedFacts { refunds_enabled: false, ..base },
+        ] {
+            let held = decide_unmatched(&facts);
+            assert_eq!((held.status, held.refund_base_units), (UnmatchedStatus::Held, 0), "{}", held.note);
+        }
+
+        let dust = decide_unmatched(&UnmatchedFacts { amount_base_units: 40, ..base });
+        assert_eq!((dust.status, dust.fee_base_units, dust.refund_base_units), (UnmatchedStatus::Kept, 40, 0),
+            "a refund below the floor is kept whole as the fee");
+        let one_unit = decide_unmatched(&UnmatchedFacts { amount_base_units: 1, ..base });
+        assert_eq!(one_unit.status, UnmatchedStatus::Kept);
     }
 }

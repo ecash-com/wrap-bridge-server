@@ -31,6 +31,13 @@ enum Command {
         #[arg(long)]
         fresh: bool,
     },
+    /// Report whether an ECX address belongs to this hot wallet (any revealed address, or one of
+    /// the first thousand of either keychain). The installer uses it to refuse an owner address
+    /// that would sweep fees back onto the server. Prints `true` or `false`; no network access.
+    OwnsAddress {
+        #[arg(long)]
+        address: String,
+    },
     /// Print the ECX wallet balance, refreshing confirmation status for UTXOs already known (not
     /// a full address-history resync - see `ChainWallet::verify_unspent`). Run `sync` or
     /// `scan-address` first if a deposit hasn't been discovered at all yet.
@@ -82,10 +89,20 @@ enum Command {
     /// `SOLANA_KEYPAIR` expects, plus its public key). Touches no config or files and needs no
     /// env vars - copy the secret somewhere safe yourself; it is not stored anywhere.
     SolanaKeygen,
-    /// Print the Solana treasury's public key.
+    /// Print the Solana treasury's public key, after connecting to the RPC and checking the mint.
     SolanaAddress,
+    /// Print the Solana treasury's public key from SOLANA_KEYPAIR alone: no network, no mint
+    /// lookup. The installer uses this so the deposit addresses exist before the machine is online.
+    SolanaPubkey,
     /// Print the Solana treasury's SOL balance (for tx fees/rent) and wECX balance.
     SolanaBalance,
+    /// List wECX deposits that reached the treasury without any order's reference key: the ones
+    /// held for a person, owed back, and (with --all) already refunded or kept. A held deposit is
+    /// refunded by hand with `solana-send`; the fee, if any, is yours to decide.
+    UnmatchedDeposits {
+        #[arg(long)]
+        all: bool,
+    },
     /// Manually send wECX from the treasury to a Solana address.
     SolanaSend {
         #[arg(long)]
@@ -172,6 +189,12 @@ async fn main() -> Result<()> {
             let mut wallet = open_ecx_wallet()?;
             let address = if fresh { wallet.fresh_address()? } else { wallet.next_address()? };
             println!("[ecx] {address}");
+        }
+        Command::OwnsAddress { address } => {
+            let config = ChainConfig::ecx();
+            let address: Address = address.parse::<Address<_>>()?.require_network(config.network)?;
+            let wallet = open_ecx_wallet()?;
+            println!("[ecx] owns {address}: {}", wallet.owns_address(&address));
         }
         Command::Balance => {
             let mut wallet = open_ecx_wallet()?;
@@ -310,6 +333,42 @@ async fn main() -> Result<()> {
         Command::SolanaAddress => {
             let wallet = open_solana_wallet().await?;
             println!("[solana] {}", wallet.pubkey());
+        }
+        Command::SolanaPubkey => {
+            let keypair = solana::keypair_from_env(&config::solana_keypair()?)?;
+            println!("[solana] {}", keypair.pubkey());
+        }
+        Command::UnmatchedDeposits { all } => {
+            let conn = db::open().await?;
+            let statuses: &[db::UnmatchedStatus] = if all {
+                &[
+                    db::UnmatchedStatus::Held,
+                    db::UnmatchedStatus::Pending,
+                    db::UnmatchedStatus::Refunding,
+                    db::UnmatchedStatus::Refunded,
+                    db::UnmatchedStatus::Kept,
+                ]
+            } else {
+                &[db::UnmatchedStatus::Held, db::UnmatchedStatus::Pending, db::UnmatchedStatus::Refunding]
+            };
+            let deposits = db::list_unmatched_deposits(&conn, statuses, 1_000).await?;
+            if deposits.is_empty() {
+                println!("[unmatched] no deposits{}", if all { "" } else { " waiting; use --all for settled ones" });
+            }
+            for d in deposits {
+                println!(
+                    "{}  {:<9}  {}  amount={} fee={} refund={}  from={}  {}{}",
+                    d.signature,
+                    d.status,
+                    d.created_at,
+                    d.amount_base_units,
+                    d.fee_base_units,
+                    d.refund_base_units,
+                    d.depositor_owner.as_deref().unwrap_or("unknown"),
+                    d.note,
+                    d.refund_signature.as_deref().map(|s| format!("  refund_tx={s}")).unwrap_or_default(),
+                );
+            }
         }
         Command::SolanaBalance => {
             let wallet = open_solana_wallet().await?;

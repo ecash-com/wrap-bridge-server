@@ -240,6 +240,21 @@ impl ChainWallet {
         self.inner.balance()
     }
 
+    /// Whether `address` is one of this wallet's own: any address it has revealed, plus the first
+    /// `PEEK_DEPTH` of each keychain whether revealed yet or not. Used to stop the cold-storage
+    /// sweep destination from being an address of the hot wallet itself, which would "sweep" fees
+    /// back onto the server while the ledger records them as moved. Derivation only, no network.
+    pub fn owns_address(&self, address: &Address) -> bool {
+        const PEEK_DEPTH: u32 = 1_000;
+        let script = address.script_pubkey();
+        if self.inner.is_mine(script.clone()) {
+            return true;
+        }
+        [KeychainKind::External, KeychainKind::Internal].into_iter().any(|keychain| {
+            (0..PEEK_DEPTH).any(|index| self.inner.peek_address(keychain, index).address.script_pubkey() == script)
+        })
+    }
+
     pub fn utxos(&self) -> Vec<LocalOutput> {
         self.inner.list_unspent().collect()
     }
@@ -694,4 +709,48 @@ fn print_tx_details(tx: &Transaction) {
         bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx)
     );
     println!("--- end tx details ---");
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use bdk_wallet::bitcoin::Network;
+
+    // BIP32 test vector 1 master key: a public throwaway that has never held funds.
+    const XPRV: &str = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+
+    #[test]
+    fn owns_address_covers_revealed_unrevealed_and_rejects_foreign_addresses() {
+        let dir = std::env::temp_dir().join(format!("wallet-owns-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ChainConfig {
+            network: Network::Bitcoin,
+            backend: Backend::Esplora,
+            esplora_url: "http://127.0.0.1:9".to_string(),
+            electrum_url: String::new(),
+            db_path: dir.join("ecx.db"),
+        };
+        let mut wallet = ChainWallet::open(
+            &config,
+            &format!("wpkh({XPRV}/84h/0h/0h/0/*)"),
+            &format!("wpkh({XPRV}/84h/0h/0h/1/*)"),
+        )
+        .unwrap();
+
+        let revealed = wallet.fresh_address().unwrap();
+        assert!(wallet.owns_address(&revealed), "a revealed deposit address is ours");
+
+        let deep_change = wallet.inner.peek_address(KeychainKind::Internal, 999).address;
+        assert!(wallet.owns_address(&deep_change), "an unrevealed address within the peek depth is ours");
+
+        let foreign: Address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+            .parse::<Address<_>>()
+            .unwrap()
+            .require_network(Network::Bitcoin)
+            .unwrap();
+        assert!(!wallet.owns_address(&foreign), "another wallet's address is not ours");
+
+        drop(wallet);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

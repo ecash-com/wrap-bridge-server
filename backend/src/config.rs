@@ -201,15 +201,29 @@ pub fn order_poll_interval() -> Duration {
 }
 
 /// How long an order can sit without a deposit ever showing up before the poller gives up on it
-/// and marks it `expired`, from `ORDER_MAX_AGE_HOURS` (default 24). Only applies while an order is
-/// still awaiting a deposit (`pending`/`deposit_seen`) - once a deposit is confirmed, the funds
-/// are already in our custody, so the poller keeps retrying the payout regardless of age.
+/// and marks it `expired`, from `ORDER_LIFETIME_MINUTES` (default 15). The older
+/// `ORDER_MAX_AGE_HOURS` is still honoured when the new name is absent. Only applies while an order
+/// is still awaiting a deposit (`pending`) - once a deposit is seen, the funds are customer money
+/// and the order never expires. Expiry is decided on poller ticks, so the effective lifetime is
+/// this plus up to one `order_poll_interval`. An order whose deposit arrives after expiry is revived
+/// for `expiry_grace`, both by the poller and when the customer opens the order page.
 pub fn order_max_age() -> Duration {
-    let hours = std::env::var("ORDER_MAX_AGE_HOURS")
+    let minutes = std::env::var("ORDER_LIFETIME_MINUTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(24);
-    Duration::from_secs(hours.max(1) * 3600)
+        .or_else(|| {
+            std::env::var("ORDER_MAX_AGE_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|hours| hours.saturating_mul(60))
+        })
+        .unwrap_or(15);
+    Duration::from_secs(minutes.max(1) * 60)
+}
+
+/// `order_max_age` in whole minutes, for telling customers how long they have to pay.
+pub fn order_lifetime_minutes() -> u64 {
+    order_max_age().as_secs() / 60
 }
 
 /// Per-request socket timeout for the Esplora HTTP client, from `ESPLORA_TIMEOUT_SECS` (default
@@ -264,18 +278,24 @@ pub fn max_deposit_amount() -> Amount {
     Amount::from_sat(env_u64("MAX_DEPOSIT_AMOUNT_SAT", 21_000_000 * 100_000_000))
 }
 
-/// Global cap on orders created per rolling minute, from `ORDERS_PER_MINUTE` (default 30). Every
-/// `POST /orders` costs a Solana RPC call, a persisted wallet address, and a DB row that the poller
-/// then re-syncs every tick, and the backend has no auth. This is global rather than per-client
-/// because the backend only ever sees the frontend proxy's address - per-IP limits belong at the
-/// reverse proxy in front of the frontend.
+/// Global backstop on orders created per rolling minute, both directions combined, from
+/// `ORDERS_PER_MINUTE` (default 120, about two per second; `0` disables it). Every `POST /orders`
+/// costs a few Solana RPC calls, a persisted wallet address, and a DB row that the poller then
+/// re-syncs every tick, and the backend has no auth. This is global rather than per-client because
+/// the backend only ever sees the frontend proxy's address, so it cannot tell clients apart. The
+/// per-client limits are in front of it: the frontend's per-address limiter and the Cloudflare rate
+/// limiting rule (deploy/edge/cloudflare.md), which refuses floods before they reach the tunnel.
+///
+/// The default is sized so that a burst at the full rate (roughly three RPC calls per order) stays
+/// within the public mainnet-beta RPC's per-address allowance; legitimate traffic should never reach
+/// it. A tighter value trades protection of the RPC quota for refusing real customers during a spike.
 ///
 /// There is no separate daily creation quota. A shared daily budget is itself a denial of service:
 /// filling it locks out every customer, including ones who would have paid. Sustained flooding is
-/// bounded by `max_pending_orders` instead. With the 24-hour order lifetime, that is also the bound
-/// on how many fresh deposit addresses can be revealed per day once the open set is full.
+/// bounded by `max_pending_orders` instead: with the short order lifetime, the open set turns over
+/// every few poll ticks, so that cap bounds the work of one tick rather than a day's address reveals.
 pub fn max_orders_per_minute() -> u64 {
-    env_u64("ORDERS_PER_MINUTE", 30)
+    env_u64("ORDERS_PER_MINUTE", 120)
 }
 
 /// How long after an order expires the poller keeps looking for a late deposit, from
@@ -285,11 +305,16 @@ pub fn expiry_grace() -> Duration {
     Duration::from_secs(env_u64("ORDER_EXPIRY_GRACE_HOURS", 168).max(1) * 3600)
 }
 
-/// Cap on simultaneously `pending` (deposit-awaited) orders, from `MAX_PENDING_ORDERS` (default
-/// 200). Bounds the address set the poller syncs each tick and the wallet-store growth from
-/// unfunded orders.
+/// Cap on simultaneously `pending` (deposit-awaited) orders per direction, from
+/// `MAX_PENDING_ORDERS` (default 500). This is what bounds the work of one poll tick: every pending
+/// wrap costs one Esplora address lookup (batched, in chunks that release the wallet lock between
+/// them - see `server::sync_scripts_in_chunks`), and every pending unwrap costs one Solana RPC
+/// signature lookup. At the default, a full set is a few hundred small requests per tick, which
+/// the public endpoints absorb; with the 15-minute lifetime, legitimate traffic rarely holds more
+/// than a few dozen open at once. Raise it when running your own Esplora and RPC; past a few
+/// thousand, a tick's unwrap lookups stop fitting inside the poll interval.
 pub fn max_pending_orders() -> u64 {
-    env_u64("MAX_PENDING_ORDERS", 200)
+    env_u64("MAX_PENDING_ORDERS", 500)
 }
 
 /// Minimum spacing between explorer syncs triggered by `GET /orders/{id}`, from
@@ -372,6 +397,30 @@ pub fn pegout_fee_bps() -> u64 {
     fee_bps("PEGOUT_FEE_BPS", 100)
 }
 
+/// Fee kept from a wECX deposit that reached the treasury without any order's reference key, in
+/// basis points, from `UNMATCHED_DEPOSIT_FEE_BPS` (default 100 = 1%). The rest is sent back to the
+/// wallet it came from - see `server::scan_unmatched_deposits_once`. The fee covers the refund's
+/// network cost and discourages using the treasury as a free round trip.
+pub fn unmatched_deposit_fee_bps() -> u64 {
+    fee_bps("UNMATCHED_DEPOSIT_FEE_BPS", 100)
+}
+
+/// Whether reference-less wECX deposits are refunded automatically, from
+/// `UNMATCHED_DEPOSIT_REFUNDS` (default on). Off records them for manual review instead; nothing
+/// is ever sent in that mode. Detection itself always runs.
+pub fn unmatched_deposit_refunds_enabled() -> bool {
+    !matches!(std::env::var("UNMATCHED_DEPOSIT_REFUNDS").as_deref(), Ok("0") | Ok("false"))
+}
+
+/// Wallets the operator tops the treasury up from, from `TREASURY_FUNDING_ADDRESSES` (comma
+/// separated, optional). A reference-less deposit from one of these is liquidity, not a customer
+/// mistake, and is kept. The earnings owner address is always treated as one of these.
+pub fn treasury_funding_addresses() -> Vec<String> {
+    std::env::var("TREASURY_FUNDING_ADDRESSES")
+        .map(|value| value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 fn fee_bps(var: &str, default: u64) -> u64 {
     let value = std::env::var(var)
         .ok()
@@ -397,6 +446,28 @@ pub fn live_payouts_allowed() -> bool {
 pub fn solana_rpc_url() -> String {
     std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string())
+}
+
+/// Block-explorer page for an ECX transaction, without the trailing `/<txid>`, from
+/// `ECX_EXPLORER_TX_URL`. The default is derived from `ECX_ESPLORA_URL`: an Esplora API lives at
+/// `<site>/api`, and the matching site shows a transaction at `<site>/tx/<txid>`. An explicit
+/// empty value turns the links off; the frontend then shows bare transaction ids.
+pub fn ecx_explorer_tx_url() -> String {
+    if let Ok(value) = std::env::var("ECX_EXPLORER_TX_URL") {
+        return value.trim().trim_end_matches('/').to_string();
+    }
+    let esplora = std::env::var("ECX_ESPLORA_URL")
+        .unwrap_or_else(|_| "https://explorer.beta.ecash.ninja/api".to_string());
+    let site = esplora.trim().trim_end_matches('/');
+    let site = site.strip_suffix("/api").unwrap_or(site);
+    format!("{site}/tx")
+}
+
+/// Same for Solana, from `SOLANA_EXPLORER_TX_URL` (default Solscan). The signature is appended.
+pub fn solana_explorer_tx_url() -> String {
+    std::env::var("SOLANA_EXPLORER_TX_URL")
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| "https://solscan.io/tx".to_string())
 }
 
 /// Base58-encoded 64-byte secret key (the standard `solana-keygen` format) for the treasury
@@ -432,12 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn earnings_config_accepts_approved_addresses_and_rejects_unknown_keys() {
-        let text = include_str!("../earnings.toml");
+    fn earnings_config_accepts_the_example_and_rejects_unknown_keys_and_bad_addresses() {
+        // The shipped example is what a developer copies; it must parse, and its sample addresses
+        // must be well-formed so a copied file fails only on the operator's own mistakes.
+        let text = include_str!("../earnings.toml.example");
         let settings = EarningsConfig::parse(text).unwrap();
+        assert!(!settings.enabled, "the example must not enable sweeps");
         assert_eq!(settings.thresholds(8).unwrap(), (10_000_000_000, 10_000_000_000));
         assert!(EarningsConfig::parse(&format!("{text}\nmisspelled_threshold = 1\n")).is_err());
-        assert!(EarningsConfig::parse(&text.replace("bc1qress9jkv0x7z3mc5tev9cnx9wk235kvsq0yur5", "invalid")).is_err());
+        assert!(EarningsConfig::parse(&text.replace("bc1q4jkcq5jllzmjypjx8vwy0n42vxzl0w4l5zn4tu", "bc1qinvalid")).is_err());
+        assert!(EarningsConfig::parse(&text.replace("BgPMuJ6FqLNbtNgHAk6hQBW7Nj9Q1U8udJ7ZzL3iVM7j", "not-a-pubkey")).is_err());
     }
 
     #[test]
@@ -475,6 +550,57 @@ mod tests {
         unsafe {
             std::env::remove_var("ASSET_TICKER");
         }
+    }
+
+    #[test]
+    fn order_lifetime_defaults_to_fifteen_minutes_and_honours_the_old_hours_name() {
+        unsafe {
+            std::env::remove_var("ORDER_LIFETIME_MINUTES");
+            std::env::remove_var("ORDER_MAX_AGE_HOURS");
+        }
+        assert_eq!(order_lifetime_minutes(), 15);
+        unsafe {
+            std::env::set_var("ORDER_MAX_AGE_HOURS", "2");
+        }
+        assert_eq!(order_lifetime_minutes(), 120);
+        unsafe {
+            std::env::set_var("ORDER_LIFETIME_MINUTES", "30");
+        }
+        assert_eq!(order_lifetime_minutes(), 30, "the minutes name wins when both are set");
+        unsafe {
+            std::env::set_var("ORDER_LIFETIME_MINUTES", "0");
+        }
+        assert_eq!(order_lifetime_minutes(), 1, "clamped to at least one minute");
+        unsafe {
+            std::env::remove_var("ORDER_LIFETIME_MINUTES");
+            std::env::remove_var("ORDER_MAX_AGE_HOURS");
+        }
+    }
+
+    #[test]
+    fn explorer_tx_url_is_derived_from_the_esplora_api_url() {
+        unsafe {
+            std::env::remove_var("ECX_EXPLORER_TX_URL");
+            std::env::set_var("ECX_ESPLORA_URL", "https://explorer.beta.ecash.ninja/api/");
+        }
+        assert_eq!(ecx_explorer_tx_url(), "https://explorer.beta.ecash.ninja/tx");
+        unsafe {
+            std::env::set_var("ECX_ESPLORA_URL", "https://esplora.example.org/api");
+        }
+        assert_eq!(ecx_explorer_tx_url(), "https://esplora.example.org/tx");
+        unsafe {
+            std::env::set_var("ECX_EXPLORER_TX_URL", "");
+        }
+        assert_eq!(ecx_explorer_tx_url(), "", "an explicit empty value turns links off");
+        unsafe {
+            std::env::set_var("ECX_EXPLORER_TX_URL", "https://other.example/tx/");
+        }
+        assert_eq!(ecx_explorer_tx_url(), "https://other.example/tx");
+        unsafe {
+            std::env::remove_var("ECX_EXPLORER_TX_URL");
+            std::env::remove_var("ECX_ESPLORA_URL");
+        }
+        assert_eq!(solana_explorer_tx_url(), "https://solscan.io/tx");
     }
 
     #[test]

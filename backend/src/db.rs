@@ -53,7 +53,12 @@ CREATE TABLE IF NOT EXISTS bridge_orders (
     -- Locked then; not repriced if the account appears or disappears before payout. 0 if it existed.
     ata_rent_lamports INTEGER NOT NULL DEFAULT 0 CHECK (ata_rent_lamports >= 0),
     -- Native-coin price of that rent, 1:1 and rounded up. Included in amount_in_sat. Not a wrap fee.
-    ata_rent_price_sat INTEGER NOT NULL DEFAULT 0 CHECK (ata_rent_price_sat >= 0)
+    ata_rent_price_sat INTEGER NOT NULL DEFAULT 0 CHECK (ata_rent_price_sat >= 0),
+    -- Confirmations the deposit had at the last check, so the order page can show progress toward
+    -- the required count. Not authoritative: the status transition is decided from the wallet.
+    deposit_confirmations INTEGER NOT NULL DEFAULT 0 CHECK (deposit_confirmations >= 0),
+    -- Why a refund was requested, for the customer. Empty until then.
+    refund_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS bridge_orders_status_idx ON bridge_orders (status);
@@ -133,6 +138,43 @@ CREATE TABLE IF NOT EXISTS outbound_txs (
     tx_hex TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (order_id, kind)
+);
+
+-- wECX that reached the treasury token account in a transaction carrying no order's reference
+-- key, so no order can claim it (see server::scan_unmatched_deposits_once). One row per deposit
+-- transaction. `pending` and `refunding` rows are owed back and are reserved against the
+-- treasury balance; `kept` rows are the operator's (treasury funding, or dust kept as the fee);
+-- `held` rows wait for a person. The fee is earnings once the row is `refunded` or `kept`.
+CREATE TABLE IF NOT EXISTS unmatched_deposit_statuses (
+    code TEXT PRIMARY KEY
+);
+INSERT OR IGNORE INTO unmatched_deposit_statuses (code) VALUES
+    ('pending'),
+    ('refunding'),
+    ('refunded'),
+    ('held'),
+    ('kept');
+
+CREATE TABLE IF NOT EXISTS unmatched_deposits (
+    signature TEXT PRIMARY KEY NOT NULL,
+    amount_base_units INTEGER NOT NULL CHECK (amount_base_units > 0),
+    depositor_owner TEXT,
+    fee_base_units INTEGER NOT NULL CHECK (fee_base_units >= 0),
+    refund_base_units INTEGER NOT NULL CHECK (refund_base_units >= 0),
+    status TEXT NOT NULL REFERENCES unmatched_deposit_statuses (code),
+    note TEXT NOT NULL DEFAULT '',
+    refund_signature TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS unmatched_deposits_status_idx ON unmatched_deposits (status);
+
+-- Where a background walk over an external history last stopped, by name.
+CREATE TABLE IF NOT EXISTS scan_cursors (
+    name TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 ";
 
@@ -254,6 +296,8 @@ impl Connection {
             "INTEGER NOT NULL DEFAULT 0",
         )
         .await?;
+        self.ensure_column("bridge_orders", "deposit_confirmations", "INTEGER NOT NULL DEFAULT 0").await?;
+        self.ensure_column("bridge_orders", "refund_reason", "TEXT NOT NULL DEFAULT ''").await?;
         Ok(())
     }
 
@@ -363,6 +407,10 @@ pub struct Order {
     pub ata_rent_lamports: i64,
     /// Native-coin price of `ata_rent_lamports`, included in `amount_in_sat`. Not a wrap fee.
     pub ata_rent_price_sat: i64,
+    /// Confirmations the deposit had when last checked. 0 until a deposit is seen.
+    pub deposit_confirmations: i64,
+    /// Why a refund was requested, in words meant for the customer. Empty otherwise.
+    pub refund_reason: String,
 }
 
 pub struct NewOrder {
@@ -380,7 +428,7 @@ pub struct NewOrder {
 const ORDER_COLUMNS: &str = "id, amount_in_sat, amount_out_base_units, deposit_address, \
     solana_recipient, refund_address, status, deposit_txid, payout_signature, refund_txid, \
     created_at, updated_at, sol_stipend_lamports, sol_stipend_price_sat, \
-    ata_rent_lamports, ata_rent_price_sat";
+    ata_rent_lamports, ata_rent_price_sat, deposit_confirmations, refund_reason";
 
 fn row_to_order(row: &Row) -> Result<Order> {
     let refund_address: String = row.get(5)?;
@@ -407,6 +455,8 @@ fn row_to_order(row: &Row) -> Result<Order> {
         sol_stipend_price_sat: row.get(13)?,
         ata_rent_lamports: row.get(14)?,
         ata_rent_price_sat: row.get(15)?,
+        deposit_confirmations: row.get(16)?,
+        refund_reason: row.get(17)?,
     })
 }
 
@@ -593,6 +643,12 @@ pub async fn customer_earnings_reserve(conn: &Connection, asset: &str) -> Result
     } else {
         ("amount_out_base_units", "amount_in_base_units")
     };
+    // Refunds owed for reference-less deposits are wECX obligations too.
+    let unmatched = if asset == "wbecx" {
+        "UNION ALL SELECT refund_base_units AS amount FROM unmatched_deposits WHERE status IN ('pending', 'refunding')"
+    } else {
+        ""
+    };
     let mut rows = conn.query(
         &format!("SELECT COALESCE(SUM(amount), 0) FROM (
             SELECT {wrap_amount} AS amount FROM bridge_orders
@@ -602,6 +658,7 @@ pub async fn customer_earnings_reserve(conn: &Connection, asset: &str) -> Result
             SELECT {unwrap_amount} AS amount FROM pegout_orders
             WHERE status NOT IN ('paid_out', 'refunded') AND
                 (deposit_signature IS NOT NULL OR status IN ('deposit_seen', 'deposit_confirmed', 'paying_out', 'refund_requested', 'refunding'))
+            {unmatched}
          )"), (),
     ).await?;
     let amount: i64 = rows.next().await?.context("missing customer reserve result")?.get(0)?;
@@ -799,17 +856,19 @@ pub async fn update_deposit(
     deposit_txid: &str,
     amount_in_sat: Amount,
     amount_out_base_units: u64,
+    confirmations: u32,
 ) -> Result<bool> {
     let rows_affected = conn
         .execute(
             "UPDATE bridge_orders SET status = ?, deposit_txid = ?, amount_in_sat = ?, \
-             amount_out_base_units = ?, updated_at = unixepoch() \
+             amount_out_base_units = ?, deposit_confirmations = ?, updated_at = unixepoch() \
              WHERE id = ? AND status IN (?, ?)",
             (
                 status.label(),
                 deposit_txid,
                 to_i64(amount_in_sat.to_sat())?,
                 to_i64(amount_out_base_units)?,
+                i64::from(confirmations),
                 id,
                 OrderStatus::Pending.label(),
                 OrderStatus::DepositSeen.label(),
@@ -867,10 +926,13 @@ pub async fn reserved_wecx_amount(conn: &Connection) -> Result<u64> {
         None => 0,
     };
     let pending_sweeps = pending_earnings_sweeps(conn).await?;
-    pending_sweeps.iter().filter(|sweep| sweep.asset == "wbecx")
+    let reserved = pending_sweeps.iter().filter(|sweep| sweep.asset == "wbecx")
         .try_fold(u64::try_from(sat)?, |reserved, sweep| {
             reserved.checked_add(sweep.amount).context("reserved wbECX amount overflow")
-        })
+        })?;
+    reserved
+        .checked_add(reserved_unmatched_refunds(conn).await?)
+        .context("reserved wbECX amount overflow")
 }
 
 /// Atomically claims an order for payout by transitioning `deposit_confirmed -> paying_out`.
@@ -953,13 +1015,14 @@ pub async fn revert_claim(conn: &Connection, id: &str) -> Result<()> {
 /// Routes a `deposit_confirmed` order to a refund instead of a payout - currently only used when a
 /// deposit reprices to zero wECX (see `server::detect_deposit`). Returns `true` iff this call won
 /// the transition.
-pub async fn request_refund(conn: &Connection, id: &str) -> Result<bool> {
+pub async fn request_refund(conn: &Connection, id: &str, reason: &str) -> Result<bool> {
     let rows_affected = conn
         .execute(
-            "UPDATE bridge_orders SET status = ?, updated_at = unixepoch() \
+            "UPDATE bridge_orders SET status = ?, refund_reason = ?, updated_at = unixepoch() \
              WHERE id = ? AND status = ?",
             (
                 OrderStatus::RefundRequested.label(),
+                reason,
                 id,
                 OrderStatus::DepositConfirmed.label(),
             ),
@@ -1488,9 +1551,331 @@ pub async fn revert_pegout_refund_claim(conn: &Connection, id: &str) -> Result<(
     Ok(())
 }
 
+// --- Reference-less treasury deposits -------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmatchedStatus {
+    /// Owed back; the refund has not been attempted yet.
+    Pending,
+    /// A refund is signed or in flight - see `claim_unmatched_refund`.
+    Refunding,
+    Refunded,
+    /// Needs a person: depositor unknown, not an ordinary wallet, or refunds are off.
+    Held,
+    /// Stays in the treasury on purpose: operator funding, or dust kept as the fee.
+    Kept,
+}
+
+impl UnmatchedStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            UnmatchedStatus::Pending => "pending",
+            UnmatchedStatus::Refunding => "refunding",
+            UnmatchedStatus::Refunded => "refunded",
+            UnmatchedStatus::Held => "held",
+            UnmatchedStatus::Kept => "kept",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnmatchedDeposit {
+    pub signature: String,
+    pub amount_base_units: u64,
+    pub depositor_owner: Option<String>,
+    pub fee_base_units: u64,
+    pub refund_base_units: u64,
+    pub status: String,
+    pub note: String,
+    pub refund_signature: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub struct NewUnmatchedDeposit<'a> {
+    pub signature: &'a str,
+    pub amount_base_units: u64,
+    pub depositor_owner: Option<&'a str>,
+    pub fee_base_units: u64,
+    pub refund_base_units: u64,
+    pub status: UnmatchedStatus,
+    pub note: &'a str,
+}
+
+const UNMATCHED_COLUMNS: &str = "signature, amount_base_units, depositor_owner, fee_base_units, \
+    refund_base_units, status, note, refund_signature, created_at, updated_at";
+
+fn row_to_unmatched(row: &Row) -> Result<UnmatchedDeposit> {
+    Ok(UnmatchedDeposit {
+        signature: row.get(0)?,
+        amount_base_units: u64::try_from(row.get::<i64>(1)?)?,
+        depositor_owner: row.get(2)?,
+        fee_base_units: u64::try_from(row.get::<i64>(3)?)?,
+        refund_base_units: u64::try_from(row.get::<i64>(4)?)?,
+        status: row.get(5)?,
+        note: row.get(6)?,
+        refund_signature: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+/// Records a deposit once. Returns `false` if that signature was already on file, so a rescan
+/// of the same history never duplicates a row or re-opens a settled one.
+pub async fn insert_unmatched_deposit(conn: &Connection, deposit: &NewUnmatchedDeposit<'_>) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "INSERT OR IGNORE INTO unmatched_deposits \
+             (signature, amount_base_units, depositor_owner, fee_base_units, refund_base_units, status, note) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                deposit.signature,
+                to_i64(deposit.amount_base_units)?,
+                deposit.depositor_owner,
+                to_i64(deposit.fee_base_units)?,
+                to_i64(deposit.refund_base_units)?,
+                deposit.status.label(),
+                deposit.note,
+            ),
+        )
+        .await
+        .context("failed to record unmatched deposit")?;
+    Ok(rows > 0)
+}
+
+pub async fn list_unmatched_deposits(
+    conn: &Connection,
+    statuses: &[UnmatchedStatus],
+    limit: u64,
+) -> Result<Vec<UnmatchedDeposit>> {
+    let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT {UNMATCHED_COLUMNS} FROM unmatched_deposits WHERE status IN ({placeholders}) \
+         ORDER BY created_at ASC LIMIT {}",
+        i64::try_from(limit).unwrap_or(i64::MAX)
+    );
+    let params = rusqlite::params_from_iter(statuses.iter().map(|status| status.label()));
+    let mut rows = conn.query(&sql, params).await.context("failed to query unmatched deposits")?;
+    let mut deposits = Vec::new();
+    while let Some(row) = rows.next().await? {
+        deposits.push(row_to_unmatched(&row)?);
+    }
+    Ok(deposits)
+}
+
+/// `pending -> refunding`. `true` iff this call won the claim.
+pub async fn claim_unmatched_refund(conn: &Connection, signature: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE unmatched_deposits SET status = 'refunding', updated_at = unixepoch() \
+             WHERE signature = ? AND status = 'pending'",
+            (signature,),
+        )
+        .await
+        .context("failed to claim unmatched deposit for refund")?;
+    Ok(rows == 1)
+}
+
+/// Durable before broadcast, like `record_pegout_refund_signature`.
+pub async fn record_unmatched_refund_signature(conn: &Connection, signature: &str, refund_signature: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE unmatched_deposits SET refund_signature = ?, updated_at = unixepoch() \
+             WHERE signature = ? AND status = 'refunding'",
+            (refund_signature, signature),
+        )
+        .await
+        .context("failed to record unmatched refund signature")?;
+    Ok(rows == 1)
+}
+
+pub async fn finish_unmatched_refund(conn: &Connection, signature: &str, refund_signature: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE unmatched_deposits SET status = 'refunded', refund_signature = ?, updated_at = unixepoch() \
+             WHERE signature = ? AND status = 'refunding'",
+            (refund_signature, signature),
+        )
+        .await
+        .context("failed to finish unmatched refund")?;
+    Ok(rows == 1)
+}
+
+pub async fn revert_unmatched_refund_claim(conn: &Connection, signature: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE unmatched_deposits SET status = 'pending', refund_signature = NULL, updated_at = unixepoch() \
+         WHERE signature = ? AND status = 'refunding'",
+        (signature,),
+    )
+    .await
+    .context("failed to revert unmatched refund claim")?;
+    Ok(())
+}
+
+/// Parks a `pending` or `refunding` row for a person, keeping any signature on file.
+pub async fn hold_unmatched_deposit(conn: &Connection, signature: &str, note: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE unmatched_deposits SET status = 'held', note = ?, updated_at = unixepoch() \
+         WHERE signature = ? AND status IN ('pending', 'refunding')",
+        (note, signature),
+    )
+    .await
+    .context("failed to hold unmatched deposit")?;
+    Ok(())
+}
+
+/// wECX owed back for reference-less deposits that are not yet refunded.
+pub async fn reserved_unmatched_refunds(conn: &Connection) -> Result<u64> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(SUM(refund_base_units), 0) FROM unmatched_deposits \
+             WHERE status IN ('pending', 'refunding')",
+            (),
+        )
+        .await
+        .context("failed to query reserved unmatched refunds")?;
+    let amount: i64 = rows.next().await?.context("missing reserved unmatched refunds row")?.get(0)?;
+    Ok(u64::try_from(amount)?)
+}
+
+/// Fees kept from settled reference-less deposits, as `(fee, 0)` pairs so they add into the
+/// unwrap-side earnings the same way completed orders do (see `server::sweep_earnings_once`).
+pub async fn unmatched_deposit_fees(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT fee_base_units FROM unmatched_deposits \
+             WHERE status IN ('refunded', 'kept') AND fee_base_units > 0",
+            (),
+        )
+        .await
+        .context("failed to query unmatched deposit fees")?;
+    let mut fees = Vec::new();
+    while let Some(row) = rows.next().await? {
+        fees.push((u64::try_from(row.get::<i64>(0)?)?, 0));
+    }
+    Ok(fees)
+}
+
+/// Counts by status: (held, pending or refunding, refunded).
+pub async fn unmatched_deposit_counts(conn: &Connection) -> Result<(u64, u64, u64)> {
+    let mut rows = conn
+        .query(
+            "SELECT \
+                COALESCE(SUM(status = 'held'), 0), \
+                COALESCE(SUM(status IN ('pending', 'refunding')), 0), \
+                COALESCE(SUM(status = 'refunded'), 0) \
+             FROM unmatched_deposits",
+            (),
+        )
+        .await
+        .context("failed to count unmatched deposits")?;
+    let row = rows.next().await?.context("missing unmatched deposit counts")?;
+    Ok((
+        u64::try_from(row.get::<i64>(0)?)?,
+        u64::try_from(row.get::<i64>(1)?)?,
+        u64::try_from(row.get::<i64>(2)?)?,
+    ))
+}
+
+/// Every reference key ever handed to a peg-out order. A treasury deposit whose transaction
+/// touches one of these belongs to that order's flow, whatever its state.
+pub async fn pegout_reference_pubkeys(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut rows = conn
+        .query("SELECT reference_pubkey FROM pegout_orders", ())
+        .await
+        .context("failed to query pegout reference keys")?;
+    let mut keys = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await? {
+        keys.insert(row.get::<String>(0)?);
+    }
+    Ok(keys)
+}
+
+pub async fn is_pegout_deposit_signature(conn: &Connection, signature: &str) -> Result<bool> {
+    let mut rows = conn
+        .query("SELECT 1 FROM pegout_orders WHERE deposit_signature = ? LIMIT 1", (signature,))
+        .await
+        .context("failed to check pegout deposit signature")?;
+    Ok(rows.next().await?.is_some())
+}
+
+pub async fn scan_cursor(conn: &Connection, name: &str) -> Result<Option<String>> {
+    let mut rows = conn
+        .query("SELECT value FROM scan_cursors WHERE name = ?", (name,))
+        .await
+        .context("failed to read scan cursor")?;
+    Ok(match rows.next().await? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
+pub async fn set_scan_cursor(conn: &Connection, name: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO scan_cursors (name, value) VALUES (?, ?) \
+         ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+        (name, value),
+    )
+    .await
+    .context("failed to write scan cursor")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod recent_order_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unmatched_deposits_reserve_until_refunded_and_fees_count_once_settled() {
+        let conn = Connection(Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())));
+        conn.execute_batch(SCHEMA).await.unwrap();
+        assert_eq!(scan_cursor(&conn, "treasury_deposits").await.unwrap(), None);
+        set_scan_cursor(&conn, "treasury_deposits", "sig-a").await.unwrap();
+        set_scan_cursor(&conn, "treasury_deposits", "sig-b").await.unwrap();
+        assert_eq!(scan_cursor(&conn, "treasury_deposits").await.unwrap().as_deref(), Some("sig-b"));
+
+        let pending = NewUnmatchedDeposit {
+            signature: "dep-1", amount_base_units: 10_000, depositor_owner: Some("wallet"),
+            fee_base_units: 100, refund_base_units: 9_900, status: UnmatchedStatus::Pending, note: "",
+        };
+        assert!(insert_unmatched_deposit(&conn, &pending).await.unwrap());
+        assert!(!insert_unmatched_deposit(&conn, &pending).await.unwrap(), "a rescan must not duplicate");
+        assert!(insert_unmatched_deposit(&conn, &NewUnmatchedDeposit {
+            signature: "dep-2", amount_base_units: 5, depositor_owner: Some("wallet"),
+            fee_base_units: 5, refund_base_units: 0, status: UnmatchedStatus::Kept, note: "dust",
+        }).await.unwrap());
+        assert!(insert_unmatched_deposit(&conn, &NewUnmatchedDeposit {
+            signature: "dep-3", amount_base_units: 777, depositor_owner: None,
+            fee_base_units: 0, refund_base_units: 0, status: UnmatchedStatus::Held, note: "unknown depositor",
+        }).await.unwrap());
+
+        assert_eq!(reserved_unmatched_refunds(&conn).await.unwrap(), 9_900);
+        assert_eq!(reserved_wecx_amount(&conn).await.unwrap(), 9_900, "owed refunds are not wrap float");
+        assert_eq!(customer_earnings_reserve(&conn, "wbecx").await.unwrap(), 9_900);
+        assert_eq!(customer_earnings_reserve(&conn, "becx").await.unwrap(), 0);
+        assert_eq!(unmatched_deposit_fees(&conn).await.unwrap(), vec![(5, 0)], "only settled rows earn");
+        assert_eq!(unmatched_deposit_counts(&conn).await.unwrap(), (1, 1, 0));
+
+        assert!(claim_unmatched_refund(&conn, "dep-1").await.unwrap());
+        assert!(!claim_unmatched_refund(&conn, "dep-1").await.unwrap(), "a second claim must lose");
+        assert_eq!(reserved_unmatched_refunds(&conn).await.unwrap(), 9_900, "still owed while refunding");
+        assert!(record_unmatched_refund_signature(&conn, "dep-1", "refund-sig").await.unwrap());
+        revert_unmatched_refund_claim(&conn, "dep-1").await.unwrap();
+        let row = &list_unmatched_deposits(&conn, &[UnmatchedStatus::Pending], 10).await.unwrap()[0];
+        assert_eq!((row.signature.as_str(), row.refund_signature.as_deref()), ("dep-1", None));
+        assert!(claim_unmatched_refund(&conn, "dep-1").await.unwrap());
+        assert!(finish_unmatched_refund(&conn, "dep-1", "refund-sig-2").await.unwrap());
+        assert_eq!(reserved_unmatched_refunds(&conn).await.unwrap(), 0);
+        let mut fees = unmatched_deposit_fees(&conn).await.unwrap();
+        fees.sort();
+        assert_eq!(fees, vec![(5, 0), (100, 0)]);
+        assert_eq!(unmatched_deposit_counts(&conn).await.unwrap(), (1, 0, 1));
+
+        hold_unmatched_deposit(&conn, "dep-1", "x").await.unwrap();
+        assert_eq!(unmatched_deposit_counts(&conn).await.unwrap(), (1, 0, 1), "a refunded row cannot be held");
+        assert!(!is_pegout_deposit_signature(&conn, "dep-1").await.unwrap());
+        assert!(pegout_reference_pubkeys(&conn).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn sweep_ledger_reserves_pending_and_completed_once() {

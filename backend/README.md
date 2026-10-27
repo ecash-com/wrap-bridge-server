@@ -21,6 +21,41 @@ manual CLI send requires an explicit opt-in (see **Safety** below).
   by that reference (Solana has no per-order address scheme) and sends ECX
   back from the treasury's ECX wallet.
 
+An order waits `ORDER_LIFETIME_MINUTES` (default 15) for its deposit, then
+expires and frees its slot. A deposit seen before that never expires. A deposit
+that lands after expiry revives the order for `ORDER_EXPIRY_GRACE_HOURS`
+(default 168): the poller re-checks recently expired orders every tick, and the
+order page re-checks the order the customer is looking at.
+
+**What the customer sees.** Creating an order sends the browser to a page
+whose URL contains the order's random id, which is the order's only credential;
+there are no accounts. The page polls every 20 seconds while the order can still
+change, shows the steps the order goes through with the current one marked,
+counts deposit confirmations toward `ECX_DEPOSIT_MIN_CONFS`, states why a deposit
+is being refunded (`refund_reason`), links every transaction id to a block
+explorer (`ECX_EXPLORER_TX_URL`, derived from the Esplora URL by default, and
+`SOLANA_EXPLORER_TX_URL`, Solscan by default; set either empty for bare ids),
+and offers the link itself as a copy button and a QR code for moving between
+devices. Orders are also listed per browser at `/orders`, from local storage.
+
+**Unmatched deposits.** A wECX transfer that reaches the treasury without any
+order's reference key (the customer pasted the treasury address into a wallet
+instead of opening the order's Solana Pay code) cannot be matched, and would
+otherwise sit in the treasury as float. Every tick the poller walks the treasury
+token account's history forward from where it last stopped and records each such
+finalized deposit. The rule, in order: a deposit from the earnings owner address
+or `TREASURY_FUNDING_ADDRESSES` is the operator's liquidity and is **kept**; one
+whose sender cannot be determined, is a program rather than a wallet, or arrived
+while `ALLOW_LIVE_PAYOUTS` or `UNMATCHED_DEPOSIT_REFUNDS` was off is **held** for
+a person; one whose refund would fall below the minimum is **kept** as the fee;
+anything else is **refunded** to the sending wallet minus
+`UNMATCHED_DEPOSIT_FEE_BPS` (default 1%), with the same sign, persist, broadcast,
+resolve sequence as every other Solana send. Owed refunds are reserved against
+the treasury balance and the fees count as unwrap earnings. On its first run the
+scan starts at the newest transaction; history before that is not examined.
+`unmatched-deposits` lists what is held or owed; refund a held one by hand with
+`solana-send`.
+
 The ECX wallet is a [BDK](https://bitcoindevkit.org/) wallet derived from a
 BIP39 mnemonic. The Solana treasury is a normal keypair holding an
 already-minted SPL token — this service has no mint or burn authority over
@@ -56,10 +91,18 @@ inspection (`address`, `balance`, `utxos`, `sync`), manual sends
 - The abuse-limit and treasury-floor variables documented in `.env.example`
   (`MAX_DEPOSIT_AMOUNT_SAT`, `TREASURY_MIN_SOL_LAMPORTS`,
   `ORDERS_PER_MINUTE`, `MAX_PENDING_ORDERS`, ...) are global backend limits.
-  Put per-IP rate limiting at your reverse proxy — the backend only sees
-  requests from its proxy, not client IPs. Burst creation is capped per minute.
-  Sustained creation is capped by how many orders may be open at once; there is
-  no shared daily quota, because exhausting one would refuse every customer.
+  The backend only sees its proxy's address, so per-client limits live in front
+  of it: the frontend allows eight order requests per minute per client address,
+  and a Cloudflare rate limiting rule (see `deploy/edge/cloudflare.md`) refuses
+  floods before they reach the tunnel. `ORDERS_PER_MINUTE` (default 120, `0`
+  disables) is only a backstop sized to keep a burst within the public Solana
+  RPC's allowance; legitimate traffic should never reach it. Sustained creation
+  is capped by how many orders may be open at once (`MAX_PENDING_ORDERS`); there
+  is no shared daily quota, because exhausting one would refuse every customer.
+- `earnings.toml`'s `ecx_owner_address` must not belong to the hot wallet. The
+  server refuses to start if it is one of the wallet's revealed addresses or one
+  of the first thousand of either keychain; `owns-address --address` runs the
+  same check from the CLI. The Solana owner address must not be the treasury.
 - ECX deposits are not treated as confirmed until `ECX_DEPOSIT_MIN_CONFS`
   (default 3). Do not set this to 0.
 - `.env.example` has empty key fields. Generate new keys. The process also
@@ -76,11 +119,16 @@ inspection (`address`, `balance`, `utxos`, `sync`), manual sends
 
 ## Earnings Sweeps
 
-`earnings.toml` configures automatic cold-storage transfers. Set
-`EARNINGS_CONFIG_PATH` to an absolute path in production, such as
-`/etc/ecash-bridge/earnings.toml`. If that variable is set, a missing or invalid
-file fails startup. Without the variable, the backend looks for `earnings.toml`
-in its working directory; a missing file leaves new sweeps disabled.
+`earnings.toml` configures automatic cold-storage transfers. On an installed
+bridge it is generated by `install.sh` at `/etc/ecash-bridge/earnings.toml` from
+the `OWNER_ECX_ADDRESS`, `OWNER_SOL_ADDRESS`, and `EARNINGS_THRESHOLD_*` lines of
+`params.conf`, and the service unit points `EARNINGS_CONFIG_PATH` at it. Change
+`params.conf` and run the installer again rather than editing the generated
+file. If that variable is set, a missing or invalid file fails startup. Without
+the variable, the backend looks for `earnings.toml` in its working directory; a
+missing file leaves new sweeps disabled. For a local development run, copy
+`earnings.toml.example` (sweeps off, sample addresses) to `earnings.toml`, which
+is gitignored, and fill in addresses you control.
 
 The file contains `enabled`, `earnings_threshold_wbecx`,
 `earnings_threshold_becx`, `solana_owner_address`, and `ecx_owner_address`.

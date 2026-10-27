@@ -35,12 +35,7 @@ impl SolanaWallet {
     /// config.rs), and fetches `mint`'s decimals once so every amount conversion after this uses
     /// a value read from the mint itself rather than a hardcoded/guessed constant.
     pub async fn open(rpc_url: &str, keypair_base58: &str, mint: Pubkey) -> Result<Self> {
-        crate::secrets::reject_if_public_fixture("SOLANA_KEYPAIR", keypair_base58)?;
-        let secret = bs58::decode(keypair_base58.trim())
-            .into_vec()
-            .context("SOLANA_KEYPAIR is not valid base58")?;
-        let payer = Keypair::try_from(secret.as_slice())
-            .map_err(|e| anyhow::anyhow!("SOLANA_KEYPAIR is not a valid ed25519 keypair: {e}"))?;
+        let payer = keypair_from_env(keypair_base58)?;
 
         let rpc = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
 
@@ -395,20 +390,7 @@ impl SolanaWallet {
                 .context("solana RPC returned an unparsable signature")?;
             let finalized = matches!(entry.confirmation_status, Some(TransactionConfirmationStatus::Finalized));
 
-            let tx = self
-                .rpc
-                .get_transaction_with_config(
-                    &signature,
-                    RpcTransactionConfig {
-                        encoding: Some(UiTransactionEncoding::Json),
-                        commitment: Some(CommitmentConfig::confirmed()),
-                        max_supported_transaction_version: Some(0),
-                    },
-                )
-                .await
-                .context("failed to fetch peg-out reference deposit transaction")?;
-
-            if let Some(deposit) = self.parse_reference_deposit(&tx, signature, finalized)? {
+            if let Some(deposit) = self.fetch_treasury_deposit(&signature, finalized).await? {
                 if deposit.amount_base_units < minimum_base_units {
                     continue;
                 }
@@ -416,6 +398,83 @@ impl SolanaWallet {
             }
         }
         Ok(None)
+    }
+
+    /// Fetches one transaction and reads it as a wECX deposit into the treasury - `Ok(None)` when
+    /// it moved no wECX into the treasury token account. Shared by the per-order reference lookup
+    /// and the treasury-wide scan for deposits that carry no reference at all.
+    pub async fn fetch_treasury_deposit(
+        &self,
+        signature: &Signature,
+        finalized: bool,
+    ) -> Result<Option<ReferenceDeposit>> {
+        let tx = self
+            .rpc
+            .get_transaction_with_config(
+                signature,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Json),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                },
+            )
+            .await
+            .context("failed to fetch treasury deposit transaction")?;
+        self.parse_reference_deposit(&tx, *signature, finalized)
+    }
+
+    /// Lists the treasury token account's transaction signatures newer than `until`, oldest
+    /// first, so a caller can walk them in order and record how far it got. `until` is the last
+    /// signature a previous walk processed; `None` lists the most recent page only, for a first
+    /// run that wants to start from "now" rather than examine the whole history.
+    ///
+    /// The RPC pages newest-first, so reaching `until` can take several pages after a busy period.
+    /// Paging is capped; `complete` is `false` when the cap was hit before `until` was found, in
+    /// which case the entries older than the oldest returned one were skipped and the caller should
+    /// say so, since advancing its cursor past them loses them.
+    pub async fn list_treasury_signatures(&self, until: Option<&Signature>) -> Result<TreasurySignatures> {
+        const PAGE: usize = 1_000;
+        const MAX_PAGES: usize = 10;
+        let treasury_ata = self.treasury_ata();
+        let mut before: Option<Signature> = None;
+        let mut newest_first = Vec::new();
+        let mut complete = false;
+        for _page in 0..MAX_PAGES {
+            let page = self
+                .rpc
+                .get_signatures_for_address_with_config(
+                    &treasury_ata,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: until.copied(),
+                        limit: Some(PAGE),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                    },
+                )
+                .await
+                .context("failed to list treasury token account signatures")?;
+            let page_len = page.len();
+            let oldest = page.last().and_then(|entry| entry.signature.parse::<Signature>().ok());
+            newest_first.extend(page);
+            if page_len < PAGE || until.is_none() {
+                complete = true;
+                break;
+            }
+            before = oldest;
+            if before.is_none() {
+                complete = true;
+                break;
+            }
+        }
+        let mut entries = Vec::with_capacity(newest_first.len());
+        for entry in newest_first.into_iter().rev() {
+            entries.push(TreasurySignature {
+                signature: entry.signature.parse().context("solana RPC returned an unparsable signature")?,
+                finalized: matches!(entry.confirmation_status, Some(TransactionConfirmationStatus::Finalized)),
+                failed: entry.err.is_some(),
+            });
+        }
+        Ok(TreasurySignatures { entries, complete })
     }
 
     /// Pure parsing core of `find_reference_deposit`: extracts the treasury's wECX balance delta
@@ -504,6 +563,7 @@ impl SolanaWallet {
             amount_base_units: deposited,
             depositor_owner,
             finalized,
+            account_keys,
         }))
     }
 
@@ -560,6 +620,24 @@ pub struct ReferenceDeposit {
     pub amount_base_units: u64,
     pub depositor_owner: Option<Pubkey>,
     pub finalized: bool,
+    /// Every account the transaction touched, static and address-table loaded. The treasury-wide
+    /// scan checks these against known order reference keys to tell an order's deposit from one
+    /// that carries no reference.
+    pub account_keys: Vec<String>,
+}
+
+/// One entry of the treasury token account's history - see `SolanaWallet::list_treasury_signatures`.
+pub struct TreasurySignature {
+    pub signature: Signature,
+    pub finalized: bool,
+    pub failed: bool,
+}
+
+pub struct TreasurySignatures {
+    /// Oldest first.
+    pub entries: Vec<TreasurySignature>,
+    /// `false` when paging stopped before reaching the caller's cursor.
+    pub complete: bool,
 }
 
 /// A signed, not-yet-sent wECX transfer - see `SolanaWallet::prepare_wecx_transfer`.
@@ -585,6 +663,17 @@ pub enum SignatureOutcome {
     /// Seen by the cluster but not yet confirmed.
     Pending,
     NotFound,
+}
+
+/// Decodes `SOLANA_KEYPAIR` (base58, 64 bytes) into a keypair, refusing the public fixtures. Pure:
+/// no network, so the treasury address can be derived on a machine that is not online yet.
+pub fn keypair_from_env(keypair_base58: &str) -> Result<Keypair> {
+    crate::secrets::reject_if_public_fixture("SOLANA_KEYPAIR", keypair_base58)?;
+    let secret = bs58::decode(keypair_base58.trim())
+        .into_vec()
+        .context("SOLANA_KEYPAIR is not valid base58")?;
+    Keypair::try_from(secret.as_slice())
+        .map_err(|e| anyhow::anyhow!("SOLANA_KEYPAIR is not a valid ed25519 keypair: {e}"))
 }
 
 pub fn parse_pubkey(s: &str) -> Result<Pubkey> {

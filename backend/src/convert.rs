@@ -52,6 +52,15 @@ pub fn sol_lamports_to_ecx_sat(lamports: u64) -> u64 {
     lamports.div_ceil(10)
 }
 
+/// Splits a reference-less wECX deposit into the fee the treasury keeps and the amount sent back.
+/// The fee rounds up, so the refund is never a base unit more than the deposit minus the exact
+/// percentage, and a fee of 10000 bps keeps everything.
+pub fn unmatched_refund_split(amount_base_units: u64, fee_bps: u64) -> (u64, u64) {
+    let fee_bps = fee_bps.min(10_000) as u128;
+    let fee = ((amount_base_units as u128 * fee_bps).div_ceil(10_000)) as u64;
+    (fee, amount_base_units - fee)
+}
+
 /// How a landed wrap deposit is split between the wrapped payout, a required token-account rent
 /// charge, and an optional SOL stipend. Rent is removed first, then the stipend. Neither is
 /// charged the percentage fee, and neither is turned into wrapped tokens. The stipend is dropped
@@ -183,6 +192,16 @@ pub fn wecx_base_units_to_ecx_sat(amount_in_base_units: u64, wecx_decimals: u8, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmatched_refund_fee_rounds_up_and_full_fee_keeps_everything() {
+        assert_eq!(unmatched_refund_split(10_000, 100), (100, 9_900));
+        assert_eq!(unmatched_refund_split(10_001, 100), (101, 9_900), "a partial base unit of fee rounds up");
+        assert_eq!(unmatched_refund_split(1, 100), (1, 0), "dust is all fee");
+        assert_eq!(unmatched_refund_split(5_000, 0), (0, 5_000));
+        assert_eq!(unmatched_refund_split(5_000, 10_000), (5_000, 0));
+        assert_eq!(unmatched_refund_split(5_000, 20_000), (5_000, 0), "above 100% is clamped, never negative");
+    }
 
     #[test]
     fn pegout_same_decimals_no_fee_is_a_straight_passthrough() {
