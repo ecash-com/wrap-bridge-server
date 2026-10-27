@@ -19,6 +19,8 @@ interface OrderResponse {
 	sol_stipend_price_sat: number;
 	ata_rent_lamports: number;
 	ata_rent_price_sat: number;
+	deposit_confirmations: number;
+	refund_reason: string;
 }
 
 export const GET: RequestHandler = async ({ params }) => {
@@ -39,7 +41,9 @@ export const GET: RequestHandler = async ({ params }) => {
 			solStipendLamports: order.sol_stipend_lamports,
 			solStipendPriceSat: order.sol_stipend_price_sat,
 			ataRentLamports: order.ata_rent_lamports,
-			ataRentPriceSat: order.ata_rent_price_sat
+			ataRentPriceSat: order.ata_rent_price_sat,
+			depositConfirmations: order.deposit_confirmations,
+			refundReason: order.refund_reason
 		});
 	} catch (e) {
 		if (e instanceof BackendError) throw error(e.status, e.message);

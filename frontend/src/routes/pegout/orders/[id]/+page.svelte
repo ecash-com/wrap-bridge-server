@@ -5,6 +5,9 @@
 	import { wrappedTicker } from '$lib/tickers';
 	import { ecxTicker, presentSatAmount, formatBaseUnits } from '$lib/units.svelte';
 	import { buildSolanaPayUri } from '$lib/solanaPay';
+	import OrderProgress, { type Step } from '$lib/OrderProgress.svelte';
+	import OrderLink from '$lib/OrderLink.svelte';
+	import TxLink from '$lib/TxLink.svelte';
 
 	interface Order {
 		id: string;
@@ -27,6 +30,11 @@
 	let wecxDecimals = $state<number | null>(null);
 	let treasuryPubkey = $state<string | null>(null);
 	let wecxMint = $state<string | null>(null);
+	let orderLifetimeMinutes = $state<number | null>(null);
+	let unmatchedDepositFeeFraction = $state<number | null>(null);
+	let unmatchedDepositRefunds = $state<boolean>(false);
+	let ecxExplorerTxUrl = $state<string | null>(null);
+	let solanaExplorerTxUrl = $state<string | null>(null);
 	$effect(() => {
 		fetch('/pegout/quote')
 			.then((res) => (res.ok ? res.json() : null))
@@ -35,8 +43,63 @@
 				wecxDecimals = data.wecxDecimals;
 				treasuryPubkey = data.treasuryPubkey;
 				wecxMint = data.wecxMint;
+				orderLifetimeMinutes = data.orderLifetimeMinutes;
+				unmatchedDepositFeeFraction = data.unmatchedDepositFeeFraction;
+				unmatchedDepositRefunds = data.unmatchedDepositRefunds === true;
+				ecxExplorerTxUrl = data.ecxExplorerTxUrl;
+				solanaExplorerTxUrl = data.solanaExplorerTxUrl;
 			});
 	});
+
+	let progress = $derived.by((): { steps: Step[]; current: number; failed: boolean } | null => {
+		if (!order) return null;
+		const steps: Step[] = [
+			{
+				label: `Send ${wrappedTicker()} with the Solana Pay code`,
+				hint: orderLifetimeMinutes != null ? `Within ${orderLifetimeMinutes} minutes of creating the order.` : undefined
+			},
+			{ label: 'Deposit seen on Solana', hint: 'Usually within a minute of sending.' },
+			{ label: 'Deposit finalized', hint: 'Solana finality takes under a minute. Nothing to do.' },
+			{ label: `${ecxTicker()} sent to your address`, hint: `An ${ecxTicker()} transaction; it shows up unconfirmed within minutes.` }
+		];
+		switch (order.status) {
+			case 'pending':
+				return { steps, current: 0, failed: false };
+			case 'deposit_seen':
+				return { steps, current: 2, failed: false };
+			case 'deposit_confirmed':
+			case 'paying_out':
+				return { steps, current: 3, failed: false };
+			case 'paid_out':
+				return { steps, current: 4, failed: false };
+			case 'expired':
+				return { steps, current: 0, failed: true };
+			case 'refund_requested':
+			case 'refunding':
+			case 'refunded': {
+				const refundSteps: Step[] = [
+					steps[0],
+					steps[1],
+					{ label: 'Deposit could not be redeemed', hint: order.depositorOwner ? 'It is being sent back to the wallet it came from.' : 'The operator has to send it back by hand.' },
+					{ label: `${wrappedTicker()} sent back to the wallet it came from`, hint: 'A Solana transaction, usually under a minute.' }
+				];
+				// The step that went wrong is marked, and the refund that follows is an ordinary step;
+				// once refunded everything is done.
+				return { steps: refundSteps, current: order.status === 'refunded' ? 4 : 2, failed: order.status !== 'refunded' };
+			}
+			case 'failed':
+				return { steps, current: 3, failed: true };
+			default:
+				return { steps, current: 0, failed: false };
+		}
+	});
+
+	// The page's own address, which is the order's only credential; see OrderLink.
+	let orderUrl = $derived(page.url.href);
+
+	function formatPercent(fraction: number): string {
+		return `${(fraction * 100).toFixed(fraction < 0.01 ? 2 : 1)}%`;
+	}
 
 	let orderId = $derived(page.params.id ?? '');
 
@@ -59,11 +122,20 @@
 		}
 	}
 
-	// Polling is disabled for now, same as the peg-in order page - each poll triggers a live
-	// upstream Solana RPC check on the backend. Just fetch once on load; the customer can refresh
-	// the page to get the latest status.
+	// Re-fetch while the order can still change, same as the peg-in order page. The backend
+	// throttles the Solana reference-key lookup a GET can trigger to one per 10 s across all
+	// callers. Expired orders are included so a late deposit is noticed and revives the order.
+	const TERMINAL_STATUSES = new Set(['paid_out', 'refunded', 'failed']);
+	const POLL_INTERVAL_MS = 20_000;
+
 	$effect(() => {
 		fetchOrder();
+	});
+
+	$effect(() => {
+		if (!order || TERMINAL_STATUSES.has(order.status)) return;
+		const timer = setInterval(fetchOrder, POLL_INTERVAL_MS);
+		return () => clearInterval(timer);
 	});
 
 	let solanaPayUri = $derived.by(() => {
@@ -152,12 +224,17 @@
 					{amountIn(order)} {wrappedTicker()} → {presentSatAmount(order.amountOutSat)}
 					{ecxTicker()}
 				</h1>
-				<p class="mt-1 font-mono text-xs text-zinc-600">{order.id}</p>
 			</div>
 
 			<div
 				class="rounded-2xl bg-white p-6 shadow-2xl ring-1 ring-black/10 dark:bg-zinc-900 dark:ring-white/10"
 			>
+				{#if orderUrl}
+					<OrderLink url={orderUrl} orderId={order.id} />
+				{/if}
+				{#if progress}
+					<OrderProgress steps={progress.steps} current={progress.current} failed={progress.failed} />
+				{/if}
 				{#if order.status === 'pending'}
 					<p class="mb-4 text-center text-xs text-zinc-500">
 						Send {amountIn(order)} {wrappedTicker()} with a Solana Pay-compatible wallet to start redeeming
@@ -209,21 +286,34 @@
 								>camera app</span
 							>
 							- not your wallet's own in-app scanner, since some wallets' scanners don't fill in the amount
-							or token correctly. A plain manual transfer to the treasury address won't be matched to
-							this order.
+							or token correctly. The code carries this order's reference; a plain transfer to the
+							treasury address does not, and cannot be matched to this order.
+							{#if unmatchedDepositRefunds && unmatchedDepositFeeFraction != null}
+								Such a transfer is sent back to the wallet it came from, minus a
+								<span class="font-semibold">{formatPercent(unmatchedDepositFeeFraction)} fee</span>, once
+								it finalizes. Never send from an exchange: a refund to an exchange's wallet is lost.
+							{:else}
+								Such a transfer is held for the operator to sort out by hand.
+							{/if}
 						</p>
 					</div>
 					<p class="mt-3 text-center text-xs text-zinc-600">
-						This page will update automatically once your deposit is detected.
+						This page checks for your deposit every 20 seconds and updates once it is detected.
 					</p>
 				{:else if order.status === 'deposit_seen'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						Deposit detected — waiting for finalization…
+						Deposit seen — waiting for Solana to finalize it…
 					</p>
+					{#if order.depositSignature}
+						<TxLink id={order.depositSignature} baseUrl={solanaExplorerTxUrl} label="View deposit on Solscan" />
+					{/if}
 				{:else if order.status === 'deposit_confirmed' || order.status === 'paying_out'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						Deposit confirmed — sending your {ecxTicker()} now…
+						Deposit finalized — sending your {ecxTicker()} now…
 					</p>
+					{#if order.depositSignature}
+						<TxLink id={order.depositSignature} baseUrl={solanaExplorerTxUrl} label="View deposit on Solscan" />
+					{/if}
 				{:else if order.status === 'paid_out'}
 					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">
 						{ecxTicker()} sent!
@@ -233,14 +323,25 @@
 						{ecxTicker()} at {order.ecxRecipient}
 					</p>
 					{#if order.payoutTxid}
-						<p class="mt-2 truncate text-center font-mono text-[10px] text-zinc-600">
-							{order.payoutTxid}
-						</p>
+						<TxLink id={order.payoutTxid} baseUrl={ecxExplorerTxUrl} label="View payout on explorer" />
 					{/if}
 				{:else if order.status === 'refund_requested' || order.status === 'refunding'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						This deposit couldn't be bridged — sending your {wrappedTicker()} back…
+						This deposit can't be redeemed: it was below the minimum {ecxTicker()} payout.
 					</p>
+					{#if order.depositorOwner}
+						<p class="mt-2 text-center text-xs text-zinc-500">
+							Sending the {wrappedTicker()} back to {order.depositorOwner}…
+						</p>
+					{:else}
+						<p class="mt-2 text-center text-xs font-medium text-red-600 dark:text-red-400">
+							The wallet it came from could not be determined, so the refund needs the operator. Quote
+							this order's id.
+						</p>
+					{/if}
+					{#if order.depositSignature}
+						<TxLink id={order.depositSignature} baseUrl={solanaExplorerTxUrl} label="View deposit on Solscan" />
+					{/if}
 				{:else if order.status === 'refunded'}
 					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Refunded</p>
 					{#if order.depositorOwner}
@@ -249,13 +350,15 @@
 						</p>
 					{/if}
 					{#if order.refundSignature}
-						<p class="mt-2 truncate text-center font-mono text-[10px] text-zinc-600">
-							{order.refundSignature}
-						</p>
+						<TxLink id={order.refundSignature} baseUrl={solanaExplorerTxUrl} label="View refund on Solscan" />
 					{/if}
 				{:else if order.status === 'expired'}
 					<p class="text-center text-sm font-medium text-red-600 dark:text-red-400">
-						This order expired without a deposit.
+						This order expired before a deposit was seen.
+					</p>
+					<p class="mt-2 text-center text-xs text-zinc-600">
+						Already sent {wrappedTicker()} with the code above? Keep this page open: the deposit is
+						still credited once it appears, and this order continues from there. Do not send again.
 					</p>
 				{:else if order.status === 'failed'}
 					<p class="text-center text-sm font-medium text-red-600 dark:text-red-400">
@@ -264,9 +367,6 @@
 				{/if}
 			</div>
 
-			<p class="mt-4 text-center text-xs text-zinc-600">
-				Bookmark this page — it's the only way back to this order.
-			</p>
 		{/if}
 	</div>
 </div>

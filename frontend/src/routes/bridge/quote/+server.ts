@@ -15,6 +15,10 @@ interface QuoteResponse {
 	sol_stipend_lamports: number;
 	sol_stipend_price_sat: number;
 	sol_stipend_usd_label: string;
+	order_lifetime_minutes: number;
+	required_confirmations: number;
+	ecx_explorer_tx_url: string;
+	solana_explorer_tx_url: string;
 }
 
 // Omit ?amount to get just the bridge's static parameters (fee, decimals, minimum) - no ECX amount
@@ -47,7 +51,11 @@ export const GET: RequestHandler = async ({ url }) => {
 			minAmountIn: data.min_amount_in_sat / UNIT_SCALE,
 			solStipendLamports: data.sol_stipend_lamports,
 			solStipendPriceSat: data.sol_stipend_price_sat,
-			solStipendUsdLabel: data.sol_stipend_usd_label
+			solStipendUsdLabel: data.sol_stipend_usd_label,
+			orderLifetimeMinutes: data.order_lifetime_minutes,
+			requiredConfirmations: data.required_confirmations,
+			ecxExplorerTxUrl: data.ecx_explorer_tx_url || null,
+			solanaExplorerTxUrl: data.solana_explorer_tx_url || null
 		});
 	} catch (e) {
 		if (e instanceof BackendError) throw error(e.status, e.message);

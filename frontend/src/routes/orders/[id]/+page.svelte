@@ -4,6 +4,9 @@
 	import { saveStoredOrder } from '$lib/orderHistory';
 	import { wrappedTicker } from '$lib/tickers';
 	import { ecxTicker, presentSatAmount, formatBaseUnits } from '$lib/units.svelte';
+	import OrderProgress, { type Step } from '$lib/OrderProgress.svelte';
+	import OrderLink from '$lib/OrderLink.svelte';
+	import TxLink from '$lib/TxLink.svelte';
 
 	interface Order {
 		id: string;
@@ -20,6 +23,8 @@
 		solStipendPriceSat: number;
 		ataRentLamports: number;
 		ataRentPriceSat: number;
+		depositConfirmations: number;
+		refundReason: string;
 	}
 
 	const UNIT_SCALE = 1e8;
@@ -40,13 +45,82 @@
 	let copied = $state(false);
 
 	let wecxDecimals = $state<number | null>(null);
+	let orderLifetimeMinutes = $state<number | null>(null);
+	let requiredConfirmations = $state<number | null>(null);
+	let ecxExplorerTxUrl = $state<string | null>(null);
+	let solanaExplorerTxUrl = $state<string | null>(null);
 	$effect(() => {
 		fetch('/bridge/quote')
 			.then((res) => (res.ok ? res.json() : null))
 			.then((data) => {
-				if (data) wecxDecimals = data.wecxDecimals;
+				if (!data) return;
+				wecxDecimals = data.wecxDecimals;
+				orderLifetimeMinutes = data.orderLifetimeMinutes;
+				requiredConfirmations = data.requiredConfirmations;
+				ecxExplorerTxUrl = data.ecxExplorerTxUrl;
+				solanaExplorerTxUrl = data.solanaExplorerTxUrl;
 			});
 	});
+
+	// ECX blocks arrive about every ten minutes, so the wait for confirmations is the long part
+	// of a wrap; the wording keeps it approximate.
+	const MINUTES_PER_BLOCK = 10;
+
+	let confirmationText = $derived.by(() => {
+		if (!order || requiredConfirmations == null) return 'Waiting for confirmations';
+		const have = Math.min(order.depositConfirmations, requiredConfirmations);
+		return `${have} of ${requiredConfirmations} confirmations`;
+	});
+
+	let progress = $derived.by((): { steps: Step[]; current: number; failed: boolean } | null => {
+		if (!order) return null;
+		const waitMinutes =
+			requiredConfirmations != null
+				? `about ${requiredConfirmations * MINUTES_PER_BLOCK} minutes on ${ecxTicker()}`
+				: 'a few blocks';
+		const steps: Step[] = [
+			{
+				label: `Send ${ecxTicker()} to the deposit address`,
+				hint: orderLifetimeMinutes != null ? `Within ${orderLifetimeMinutes} minutes of creating the order.` : undefined
+			},
+			{ label: 'Deposit seen on the network', hint: 'Usually within a minute of sending.' },
+			{ label: confirmationText, hint: `Takes ${waitMinutes}. Nothing to do; keep this page open or come back.` },
+			{ label: `${wrappedTicker()} sent to your Solana address`, hint: 'A Solana transaction, usually under a minute.' }
+		];
+		switch (order.status) {
+			case 'pending':
+				return { steps, current: 0, failed: false };
+			case 'deposit_seen':
+				return { steps, current: 2, failed: false };
+			case 'deposit_confirmed':
+			case 'paying_out':
+				return { steps, current: 3, failed: false };
+			case 'paid_out':
+				return { steps, current: 4, failed: false };
+			case 'expired':
+				return { steps, current: 0, failed: true };
+			case 'refund_requested':
+			case 'refunding':
+			case 'refunded': {
+				const refundSteps: Step[] = [
+					steps[0],
+					steps[1],
+					{ label: 'Deposit could not be wrapped', hint: order.refundAddress ? 'The full deposit is being sent back.' : 'A refund address is needed to send it back.' },
+					{ label: `${ecxTicker()} sent back to your refund address`, hint: 'An ECX transaction; a few minutes.' }
+				];
+				// The step that went wrong is marked, and the refund that follows is an ordinary step;
+				// once refunded everything is done.
+				return { steps: refundSteps, current: order.status === 'refunded' ? 4 : 2, failed: order.status !== 'refunded' };
+			}
+			case 'failed':
+				return { steps, current: 3, failed: true };
+			default:
+				return { steps, current: 0, failed: false };
+		}
+	});
+
+	// The page's own address, which is the order's only credential; see OrderLink.
+	let orderUrl = $derived(page.url.href);
 
 	let refundAddressInput = $state('');
 	let refundAddressSubmitting = $state(false);
@@ -85,10 +159,21 @@
 		}
 	}
 
-	// Polling is disabled for now - each poll triggers a live upstream chain-explorer sync on the
-	// backend. Just fetch once on load; the customer can refresh the page to get the latest status.
+	// Re-fetch while the order can still change. The backend throttles the chain-explorer sync a
+	// GET can trigger to one per 10 s across all callers, so polling costs it a DB read, not a
+	// network call. Expired orders are included: a deposit that arrives after the window revives
+	// the order, and the GET is what makes the backend look for it.
+	const TERMINAL_STATUSES = new Set(['paid_out', 'refunded', 'failed']);
+	const POLL_INTERVAL_MS = 20_000;
+
 	$effect(() => {
 		fetchOrder();
+	});
+
+	$effect(() => {
+		if (!order || TERMINAL_STATUSES.has(order.status)) return;
+		const timer = setInterval(fetchOrder, POLL_INTERVAL_MS);
+		return () => clearInterval(timer);
 	});
 
 	$effect(() => {
@@ -223,7 +308,6 @@
 					{presentSatAmount(order.amountInSat)}
 					{ecxTicker()} → {amountOut(order)} {wrappedTicker()}
 				</h1>
-				<p class="mt-1 font-mono text-xs text-zinc-600">{order.id}</p>
 				{#if order.ataRentPriceSat > 0}
 					<p class="mx-auto mt-3 max-w-md text-sm text-zinc-600 dark:text-zinc-400">
 						This address had no {wrappedTicker()} account, so {presentSatAmount(order.ataRentPriceSat)}
@@ -243,6 +327,12 @@
 			<div
 				class="rounded-2xl bg-white p-6 shadow-2xl ring-1 ring-black/10 dark:bg-zinc-900 dark:ring-white/10"
 			>
+				{#if orderUrl}
+					<OrderLink url={orderUrl} orderId={order.id} />
+				{/if}
+				{#if progress}
+					<OrderProgress steps={progress.steps} current={progress.current} failed={progress.failed} />
+				{/if}
 				{#if order.status === 'pending'}
 					<p class="mb-4 text-center text-xs text-zinc-500">
 						Send {presentSatAmount(order.amountInSat)}
@@ -275,15 +365,18 @@
 						</button>
 					</div>
 					<p class="mt-4 text-center text-xs text-zinc-600">
-						This page will update automatically once your deposit is detected.
+						This page checks for your deposit every 20 seconds and updates once it is detected.
 					</p>
 					{#if canSetRefundAddress}
 						{@render refundAddressForm()}
 					{/if}
 				{:else if order.status === 'deposit_seen'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						Deposit detected — waiting for confirmation…
+						Deposit seen — {confirmationText.toLowerCase()}
 					</p>
+					{#if order.depositTxid}
+						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
+					{/if}
 					{#if canSetRefundAddress}
 						{@render refundAddressForm()}
 					{/if}
@@ -291,6 +384,9 @@
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
 						Deposit confirmed — sending your {wrappedTicker()} now…
 					</p>
+					{#if order.depositTxid}
+						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
+					{/if}
 					{#if canSetRefundAddress}
 						{@render refundAddressForm()}
 					{/if}
@@ -302,14 +398,26 @@
 						You received {amountOut(order)} {wrappedTicker()} at {order.solanaRecipient}
 					</p>
 					{#if order.payoutSignature}
-						<p class="mt-2 truncate text-center font-mono text-[10px] text-zinc-600">
-							{order.payoutSignature}
-						</p>
+						<TxLink id={order.payoutSignature} baseUrl={solanaExplorerTxUrl} label="View payout on Solscan" />
 					{/if}
 				{:else if order.status === 'refund_requested' || order.status === 'refunding'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						This deposit couldn't be bridged — sending your refund…
+						This deposit can't be wrapped{order.refundReason ? `: ${order.refundReason}` : ''}.
 					</p>
+					{#if order.refundAddress}
+						<p class="mt-2 text-center text-xs text-zinc-500">
+							Sending the full deposit back to {order.refundAddress}…
+						</p>
+					{:else}
+						<p class="mt-2 text-center text-xs font-medium text-red-600 dark:text-red-400">
+							No refund address is on file, so the refund cannot be sent. Add one below and it goes out
+							on the next check.
+						</p>
+						{@render refundAddressForm()}
+					{/if}
+					{#if order.depositTxid}
+						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
+					{/if}
 				{:else if order.status === 'refunded'}
 					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Refunded</p>
 					{#if order.refundAddress}
@@ -318,13 +426,15 @@
 						</p>
 					{/if}
 					{#if order.refundTxid}
-						<p class="mt-2 truncate text-center font-mono text-[10px] text-zinc-600">
-							{order.refundTxid}
-						</p>
+						<TxLink id={order.refundTxid} baseUrl={ecxExplorerTxUrl} label="View refund on explorer" />
 					{/if}
 				{:else if order.status === 'expired'}
 					<p class="text-center text-sm font-medium text-red-600 dark:text-red-400">
-						This order expired without a deposit.
+						This order expired before a deposit was seen.
+					</p>
+					<p class="mt-2 text-center text-xs text-zinc-600">
+						Already sent {ecxTicker()} to {order.depositAddress}? Keep this page open: the deposit is
+						still credited once it appears, and this order continues from there. Do not send again.
 					</p>
 				{:else if order.status === 'failed'}
 					<p class="text-center text-sm font-medium text-red-600 dark:text-red-400">
@@ -333,9 +443,6 @@
 				{/if}
 			</div>
 
-			<p class="mt-4 text-center text-xs text-zinc-600">
-				Bookmark this page — it's the only way back to this order.
-			</p>
 		{/if}
 	</div>
 </div>

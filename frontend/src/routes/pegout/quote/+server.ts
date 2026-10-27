@@ -10,6 +10,11 @@ interface PegoutQuoteResponse {
 	min_amount_out_sat: number;
 	treasury_pubkey: string;
 	wecx_mint: string;
+	order_lifetime_minutes: number;
+	unmatched_deposit_fee_bps: number;
+	unmatched_deposit_refunds: boolean;
+	ecx_explorer_tx_url: string;
+	solana_explorer_tx_url: string;
 }
 
 // Unlike /bridge/quote, this takes the wECX amount already in base units (?amountBaseUnits=) -
@@ -36,7 +41,12 @@ export const GET: RequestHandler = async ({ url }) => {
 			wecxDecimals: data.wecx_decimals,
 			minAmountOutSat: data.min_amount_out_sat,
 			treasuryPubkey: data.treasury_pubkey,
-			wecxMint: data.wecx_mint
+			wecxMint: data.wecx_mint,
+			orderLifetimeMinutes: data.order_lifetime_minutes,
+			unmatchedDepositFeeFraction: data.unmatched_deposit_fee_bps / 10_000,
+			unmatchedDepositRefunds: data.unmatched_deposit_refunds,
+			ecxExplorerTxUrl: data.ecx_explorer_tx_url || null,
+			solanaExplorerTxUrl: data.solana_explorer_tx_url || null
 		});
 	} catch (e) {
 		if (e instanceof BackendError) throw error(e.status, e.message);

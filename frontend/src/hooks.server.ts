@@ -1,14 +1,26 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Handle } from '@sveltejs/kit';
 
-// Baseline response hardening. The theme bootstrap is a same-origin script (`/theme-init.js`), so
-// `script-src` can stay `'self'`. This also blocks framing (clickjacking a deposit address), MIME
-// sniffing, and referrer leakage (order ids in URLs are effectively credentials).
+// Baseline response hardening: framing (clickjacking a deposit address), MIME sniffing, and
+// referrer leakage (order ids in URLs are effectively credentials). The Content-Security-Policy
+// itself is configured in svelte.config.js so SvelteKit can nonce its inline hydration script.
 // Add `Strict-Transport-Security` at the TLS-terminating proxy, where the scheme is known.
 //
-// Per-IP admission only works because Caddy is the only process that should reach this app
-// (HOST=127.0.0.1). The last X-Forwarded-For hop is the address Caddy saw. Do not trust this
-// header if the Node port is ever exposed directly.
+// Per-IP admission for order creation. Which header names the client depends on what sits in
+// front of this app, and both layouts rely on Node listening on 127.0.0.1 only:
+//
+// - Cloudflare tunnel (the installed layout): cloudflared is the only process that can reach this
+//   port. Cloudflare appends the address that connected to it to the end of X-Forwarded-For on
+//   every request, after anything the client sent, so the last hop is the client as Cloudflare saw
+//   it and cannot be displaced from the client side.
+// - Caddy relay (optional, EDGE_SHARED_TOKEN set): the token proves the request crossed the relay
+//   before CF-Connecting-IP is trusted, so a request that did not come through it cannot spoof an
+//   address into the limiter.
+//
+// Neither header is trustworthy if the Node port is ever exposed directly. This limiter is the
+// second line of defense; the first is the Cloudflare rate limiting rule described in
+// deploy/edge/cloudflare.md, which refuses floods before they enter the tunnel. The backend's own
+// ORDERS_PER_MINUTE is a global backstop behind both.
 const orderPosts = new Map<string, number[]>();
 
 function edgeToken(): string {
@@ -66,10 +78,8 @@ export const handle: Handle = async ({ event, resolve }) => {
 		}
 	}
 	const response = await resolve(event);
-	response.headers.set(
-		'Content-Security-Policy',
-		"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'"
-	);
+	// Content-Security-Policy is set by SvelteKit from svelte.config.js, with a per-response nonce
+	// for its own hydration script. Setting a fixed one here would override it and block that script.
 	response.headers.set('X-Frame-Options', 'DENY');
 	response.headers.set('X-Content-Type-Options', 'nosniff');
 	response.headers.set('Referrer-Policy', 'no-referrer');

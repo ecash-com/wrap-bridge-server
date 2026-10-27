@@ -56,6 +56,8 @@
 	let peginFeeFraction = $state<number | null>(null);
 	let peginFlatFeeSat = $state<number | null>(null);
 	let pegoutFeeFraction = $state<number | null>(null);
+	let unmatchedDepositFeeFraction = $state<number | null>(null);
+	let unmatchedDepositRefunds = $state<boolean>(false);
 	let wecxDecimals = $state<number | null>(null);
 	let minAmountIn = $state<number | null>(null);
 	let minAmountOutSat = $state<number | null>(null);
@@ -91,6 +93,8 @@
 				if (!data || cancelled) return;
 				pegoutFeeFraction = data.pegoutFeeFraction;
 				minAmountOutSat = data.minAmountOutSat;
+				unmatchedDepositFeeFraction = data.unmatchedDepositFeeFraction;
+				unmatchedDepositRefunds = data.unmatchedDepositRefunds === true;
 			});
 		return () => {
 			cancelled = true;
@@ -341,7 +345,15 @@
 				{#if direction === 'pegout'}
 					Your deposit must be sent from a wallet that supports
 					<span class="font-semibold">Solana Pay</span> (e.g. Phantom, Solflare) via the link/QR on the
-					next page - a plain manual transfer to the treasury address won't be matched to your order.
+					next page. A plain transfer to the treasury address carries no order reference and cannot be
+					matched to your order:
+					{#if unmatchedDepositRefunds && unmatchedDepositFeeFraction != null}
+						it is sent back to the wallet it came from, minus a
+						<span class="font-semibold">{formatPercent(unmatchedDepositFeeFraction)} fee</span>, once it
+						finalizes. Never send from an exchange: a refund to an exchange's wallet is lost.
+					{:else}
+						it is held for the operator to sort out by hand.
+					{/if}
 				{/if}
 			</p>
 		</div>
