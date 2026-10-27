@@ -7,10 +7,11 @@ Install on a new Ubuntu Server only after the tokens and wallets exist. The orde
 ```sh
 cp params.conf.example "$HOME/bridge-params.conf"
 ./install.sh check "$HOME/bridge-params.conf"
-sudo ./install.sh "$HOME/bridge-params.conf"
+sudo ./make-bundle.sh          # on any Ubuntu 24.04 machine with internet, same architecture
+sudo ./install.sh "$HOME/bridge-params.conf"   # on the server, online or not; installs from ./bundle
 ```
 
-Payouts stay off until you deposit both treasuries and run `sudo ./install.sh enable --i-deposited`.
+The installer downloads nothing: the server can be installed with the cable unplugged, and its first packet to the internet is then the VPN handshake. Payouts stay off until you deposit both treasuries and run `sudo ./install.sh enable --i-deposited`. `sudo ./install.sh status` shows the state of everything, and `sudo bridge-assistant` explains it with a small language model that runs only on the machine ([docs/assistant.md](docs/assistant.md)).
 
 The service takes ECX and pays wECX, or takes wECX and pays ECX. It holds both treasuries. It does not have mint authority. On a wrap, the customer can pay a fixed extra amount of the native asset to receive a small SOL stipend in the same transaction. If the recipient has no token account, the order also adds that account's rent in native coin, 1:1, and only then. A wallet with no SOL can still receive the wrapped token.
 

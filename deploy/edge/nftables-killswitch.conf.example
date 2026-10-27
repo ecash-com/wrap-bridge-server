@@ -5,7 +5,7 @@ table inet ecash_bridge_kill {
 	chain output {
 		type filter hook output priority 0; policy drop;
 		oif "lo" accept
-		oif "wg0" accept
+		oifname "wg0" accept
 		udp dport 67 oifname != "wg0" accept
 		udp dport 68 oifname != "wg0" accept
 		ip daddr REPLACE_ENDPOINT_IP udp dport REPLACE_ENDPOINT_PORT accept

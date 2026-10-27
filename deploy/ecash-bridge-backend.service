@@ -16,8 +16,11 @@ Environment=DATABASE_PATH=/opt/ecash-bridge/backend/data/bridge.db
 # Environment=HTTPS_PROXY=http://127.0.0.1:8118
 # Environment=ALL_PROXY=http://127.0.0.1:8118
 ExecStart=/opt/ecash-bridge/backend/swap-backend serve --addr 127.0.0.1:3000
+# Keeps retrying while the VPN has no connectivity yet, for instance after an offline install, and
+# comes up by itself once the tunnel carries traffic. No start-rate limit, so it never gives up.
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+StartLimitIntervalSec=0
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

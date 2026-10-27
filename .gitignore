@@ -1,1 +1,4 @@
 params.conf
+
+# Offline install bundle: built by make-bundle.sh, about 2.5 GB, never committed.
+/bundle/

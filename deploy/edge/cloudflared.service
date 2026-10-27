@@ -11,6 +11,7 @@ EnvironmentFile=/etc/ecash-bridge/cloudflared.env
 ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

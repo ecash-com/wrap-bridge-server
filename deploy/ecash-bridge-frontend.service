@@ -18,6 +18,7 @@ Environment=ADDRESS_HEADER=X-Forwarded-For
 ExecStart=/usr/local/bin/node /opt/ecash-bridge/frontend/build/index.js
 Restart=on-failure
 RestartSec=3
+StartLimitIntervalSec=0
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

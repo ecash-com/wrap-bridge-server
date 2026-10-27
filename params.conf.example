@@ -1,53 +1,154 @@
-# Copy this file outside the repository, fill it, and pass that copy to install.sh.
+# Copy this file outside the repository, fill it, and pass that copy to install.sh:
+#   cp params.conf.example "$HOME/bridge-params.conf"
+#   ./install.sh check "$HOME/bridge-params.conf"
 # Never commit the filled file. The installer does not read this example.
 #
-# How to obtain each value: docs/prepare.md
+# Every value below is a sample that shows the shape of the real one. A line whose comment says
+# "Replace" is refused by the installer until it holds your own value. Secrets are cut short
+# with "...". Lines without "Replace" are working defaults and can stay as they are.
+#
+# Format: KEY = "value", one per line, double quotes required. A value may not contain a double
+# quote, a single quote, a backslash, a dollar sign, or a backtick.
+# How to obtain each value: docs/prepare.md, deploy/edge/purchase.md, deploy/edge/cloudflare.md.
 # Do not put an account password, a Mullvad account number, or a card number here.
 
 # --- Hot wallets. Generate new ones. Do not reuse a wallet that holds other funds. ---
-WALLET_MNEMONIC = ""
+
+# Replace. 12 or 24 BIP39 English words: lowercase letters only, single spaces between words,
+# no commas or digits. Printed by: cargo run --manifest-path backend/Cargo.toml -- ecx-keygen
+WALLET_MNEMONIC = "ripple marble stove glance orbit velvet canyon hollow lunar ..."
+
+# Optional BIP39 passphrase (the "25th word"). Leave empty unless you set one on purpose and have
+# it backed up. Case matters. The forbidden characters listed above cannot be used in it.
 WALLET_PASSPHRASE = ""
-SOLANA_KEYPAIR = ""
+
+# Replace. The Solana secret key as one base58 string: 87 or 88 characters, mixed case, no
+# spaces, never the characters 0, O, I, or l. Printed as "secret key (SOLANA_KEYPAIR)" by:
+# cargo run --manifest-path backend/Cargo.toml -- solana-keygen
+# Not the public key printed next to it. That one is the treasury address, which the installer
+# prints again after install.
+SOLANA_KEYPAIR = "2K37pkW8iEUe14ZujXqpQA1UwrxDLFT7g7BzZcFeH65h7JtbTBCBsC...FHEJUeYGD"
+
+# The SPL mint this bridge holds and pays out. Keep the published mint unless you run your own.
+# A Solana address: base58, 32 to 44 characters, almost always 43 or 44.
 WECX_MINT_ADDRESS = "EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq"
+
 # Display name of the one asset this bridge wraps. The wrapped token is always "w" plus this.
 # bECX is shown as bECX and wbECX. ECX is shown as ECX and wECX. aECX is shown as aECX and waECX.
+# 1 to 16 letters and digits, starting with a letter. Case is shown as written.
 ASSET_TICKER = "bECX"
 
 # --- Owner sweeps. Customer payouts stay immediate. ---
-OWNER_ECX_ADDRESS = ""
-OWNER_SOL_ADDRESS = ""
+
+# Replace. A native segwit address you control, on a different seed from the hot wallet:
+# "bc1q" followed by 38 lowercase letters and digits, 42 characters in total. A 62-character
+# bc1q address (multisig) also works. Uppercase, "1...", "3...", and "bc1p..." are refused.
+OWNER_ECX_ADDRESS = "bc1q4jkcq5jllzmjypjx8vwy0n42vxzl0w4l5zn4tu"
+
+# Replace. A Solana wallet address you control, not the treasury: base58, 32 to 44 characters.
+# Give the wallet address, not its token account. The sweep creates the token account if needed.
+# Also top the treasury up from this wallet. A wrapped-token transfer into the treasury from any
+# other wallet, with no order behind it, looks like a customer mistake and is refunded minus the
+# fee; from this wallet it is kept as liquidity.
+OWNER_SOL_ADDRESS = "BgPMuJ6FqLNbtNgHAk6hQBW7Nj9Q1U8udJ7ZzL3iVM7j"
+
+# Whole coins, decimal point allowed (up to 8 places), no thousands separators. Collected fees
+# above this amount are swept to the owner address of that side. "100" means 100 bECX or 100 wbECX.
 EARNINGS_THRESHOLD_ECX = "100"
 EARNINGS_THRESHOLD_WECX = "100"
 
-# --- Fees. Confirmations default to 3. ---
+# --- Fees. Whole numbers only. ---
+
+# Basis points: 100 = 1.00%, 50 = 0.50%, 0 = no percentage fee. 10000 is the maximum.
 PEGIN_FEE_BPS = "100"
 PEGOUT_FEE_BPS = "100"
+# Amounts in sat: 1 coin = 100000000 sat, as with Bitcoin. 1000 sat = 0.00001000 bECX.
+# A fixed amount kept on every wrap, on top of the percentage. It pays for spending the deposit later.
 PEGIN_FLAT_FEE_SAT = "1000"
+# The smallest deposit that is paid out, in sat. Anything smaller is refunded or held for review.
 MIN_DEPOSIT_AMOUNT_SAT = "500"
+# The largest single order, in sat. The default is the whole supply, which means no cap. A lower
+# value limits what one order, and one mistake, can take from the treasury.
+MAX_DEPOSIT_AMOUNT_SAT = "2100000000000000"
+# Blocks a deposit must have before it is paid out. At least 1. Default 3.
 ECX_DEPOSIT_MIN_CONFS = "3"
+# Unwrap deposits are matched to orders by the reference key in the order's Solana Pay code. A
+# customer who pastes the treasury address into a wallet instead sends a transfer with no
+# reference, which no order can claim. Those are sent back to the wallet they came from, minus
+# this fee in basis points, once they finalize. "0" for UNMATCHED_DEPOSIT_REFUNDS holds them for
+# you to handle by hand instead; nothing is then sent automatically.
+UNMATCHED_DEPOSIT_REFUNDS = "1"
+UNMATCHED_DEPOSIT_FEE_BPS = "100"
+
+# --- Orders. Whole numbers only. ---
+
+# Minutes a new order waits for the deposit before it expires and frees its slot. A deposit that
+# is seen in time never expires. One that arrives late still revives the order for seven days,
+# so a slow customer is not lost, only shown "expired" until the payment shows up.
+ORDER_LIFETIME_MINUTES = "15"
+# Open orders allowed per direction. Each open order costs the server one explorer lookup every
+# five minutes, so this bounds the load from a flood of unpaid orders. 500 suits the public
+# explorer and Solana endpoints; raise it when you run your own.
+MAX_PENDING_ORDERS = "500"
+
 # Optional wrap checkbox: extra ECX buys a little SOL so a new wallet can move the wrapped token.
-# 5000000 lamports = 0.005 SOL. 500000 sat = 0.005 of the native asset. Set both to 0 to hide it.
-# The dollar label is display-only and goes stale. The treasury pays the SOL and token-account rent.
+# Lamports: 1 SOL = 1000000000 lamports, so 5000000 = 0.005 SOL. 500000 sat = 0.005 of the native
+# asset. Either set both to 0 to hide the checkbox, or use at least 1000000 lamports and a price
+# above 0. The dollar label is display-only and goes stale: digits with at most two decimals,
+# "0.50" is shown as about $0.50. The treasury pays the SOL and the token-account rent.
 SOL_STIPEND_LAMPORTS = "5000000"
 SOL_STIPEND_PRICE_SAT = "500000"
 SOL_STIPEND_USD_LABEL = "0.50"
 
-# --- Chain endpoints. Leave these unless you run your own. ---
+# --- Chain endpoints. Leave these unless you run your own. Both must start with https:// ---
 ECX_ESPLORA_URL = "https://explorer.beta.ecash.ninja/api/"
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+# Where the order page's "View on explorer" links point; the transaction id is appended. Leave
+# empty to derive the first from ECX_ESPLORA_URL and use Solscan for the second.
+ECX_EXPLORER_TX_URL = ""
+SOLANA_EXPLORER_TX_URL = "https://solscan.io/tx"
 
-# --- Hop 2, required. OVPN Public IPv4 WireGuard file. ---
-VPN_PROVIDER = "ovpn"
-VPN_WG_PRIVATE_KEY = ""
-VPN_WG_ADDRESS = ""
-VPN_WG_DNS = ""
-VPN_WG_PEER_PUBLIC_KEY = ""
-VPN_WG_ENDPOINT = ""
+# --- Hop 2, required: Surfshark with a Dedicated IP. See deploy/edge/purchase.md. ---
+# Surfshark is the default exit because it sells a dedicated IPv4 address, delivers it as a plain
+# WireGuard file, and lets you register a key you generated yourself. Copy each value from the
+# downloaded file exactly, without the line name. Another provider with the same three properties
+# works in the same seven lines; OVPN was also checked.
+
+# The provider, for your own records. Lowercase letters, digits, and dashes.
+VPN_PROVIDER = "surfshark"
+# Replace. The PrivateKey line under [Interface]: the key you made with wg genkey and registered
+# under "I have a key pair". 44 characters of base64 (letters, digits, + and /), ending in "=".
+# Surfshark leaves this line empty in the file because it never had the key; you fill it in.
+VPN_WG_PRIVATE_KEY = "QiwxYTymCwBeUUxuqnJ6Tffnf30+vWdZKhXq6...4X+A="
+# Replace. The Address line under [Interface]: an IPv4 address with a prefix length. Surfshark's
+# looks like 10.14.0.2/16. If the line also has an IPv6 address after a comma, paste the whole
+# line; the installer keeps the IPv4 part.
+VPN_WG_ADDRESS = "10.2.0.2/32"
+# Replace. The DNS line under [Interface]. Surfshark's lists two servers; paste the line as it
+# is, the installer keeps the first.
+VPN_WG_DNS = "203.0.113.53, 203.0.113.54"
+# Replace. The PublicKey line under [Peer]: the same 44-character base64 shape as the private key.
+VPN_WG_PEER_PUBLIC_KEY = "z7oIWcdK/CU9kcwqhIk6kGJXIO2ivQDTjAkVjlhL/aA="
+# Replace. The Endpoint line under [Peer], as an IP address and port with no spaces. Surfshark's
+# file gives a hostname such as xx-yyy.prod.surfshark.com:51820; the server may have no DNS when
+# it installs, so resolve it once on your own machine and put the address here:
+#   getent ahostsv4 xx-yyy.prod.surfshark.com | head -n 1
+VPN_WG_ENDPOINT = "203.0.113.10:51820"
+# Keep exactly this. The installer writes the IPv4 half and disables IPv6 on the machine.
 VPN_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
-VPN_PUBLIC_IPV4 = ""
+# Replace. The dedicated IPv4 address shown in Surfshark's Dedicated IP settings. It is not a
+# line in the WireGuard file. Four numbers separated by dots. After the tunnel is up, the
+# installer checks that the machine's traffic really leaves from this address.
+VPN_PUBLIC_IPV4 = "203.0.113.77"
 
-# --- Hop 1, optional. Leave every HOP1 line empty to use OVPN alone. ---
-HOP1_PROVIDER = ""
+# --- Hop 1, optional: Mullvad. Leave the six HOP1_WG lines empty to run Surfshark alone. ---
+# With hop 1, Surfshark never sees the house address: it sees a Mullvad exit, and Mullvad sees
+# the house but not the customer domain. Mullvad takes cash or Monero and needs no email, so it
+# is the hop that should know where the house is. It needs no dedicated address.
+# Fill all six lines from the Mullvad file, or none. Same shapes as the VPN_WG lines above:
+# Address looks like 10.66.123.45/32 (paste the whole line if it also has an IPv6 part), DNS is
+# 10.64.0.1, and Endpoint is an IP address with port 51820, such as 198.51.100.20:51820.
+HOP1_PROVIDER = "mullvad"
 HOP1_WG_PRIVATE_KEY = ""
 HOP1_WG_ADDRESS = ""
 HOP1_WG_DNS = ""
@@ -55,6 +156,13 @@ HOP1_WG_PEER_PUBLIC_KEY = ""
 HOP1_WG_ENDPOINT = ""
 HOP1_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
 
-# --- Cloudflare. The tunnel token is the eyJ string, not the install command. ---
-CLOUDFLARE_TUNNEL_TOKEN = ""
-CLOUDFLARE_HOSTNAME = ""
+# --- Cloudflare. See deploy/edge/cloudflare.md. ---
+
+# Replace. The tunnel token: the long "eyJ..." string inside the install command Cloudflare shows,
+# about 180 characters of base64 with nothing before or after it. Not the whole command, not the
+# tunnel ID, and not an API token.
+CLOUDFLARE_TUNNEL_TOKEN = "eyJhIjoiYTExYjAxNWIzZjU1YjhmMzllNGRmZjBkNTk4ZjRiMDMiLCJ0Ijoi...ifQ=="
+# Replace. The published hostname: lowercase, one label under your zone, such as swap.example.com
+# or swap.example.co.uk. Not a URL (no https://), and not swap.beta.ecash.com. A name two labels
+# under a .com zone, like a.b.example.com, needs a paid Cloudflare certificate.
+CLOUDFLARE_HOSTNAME = "swap.example.com"
