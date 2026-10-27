@@ -7,8 +7,9 @@ Use a new domain. `swap.beta.ecash.com` already published `172.237.148.99`.
 ## 1. Buy the path
 
 1. Follow [../deploy/edge/purchase.md](../deploy/edge/purchase.md) for the two VPNs. Hop 2, Surfshark with a Dedicated IP, is required. Hop 1, Mullvad, is optional and keeps the house address away from Surfshark.
-2. Follow [../deploy/edge/cloudflare.md](../deploy/edge/cloudflare.md) for the domain, the nameservers, and the tunnel. Add no A or AAAA record.
-3. Pay Mullvad, the exit VPN, and Cloudflare with different instruments. Do not use the same email for the exit VPN and Cloudflare.
+2. Follow [../deploy/edge/solana-rpc.md](../deploy/edge/solana-rpc.md) for a paid Solana mainnet RPC. The public endpoint is refused.
+3. Follow [../deploy/edge/cloudflare.md](../deploy/edge/cloudflare.md) for the domain, the nameservers, and the tunnel. Add no A or AAAA record.
+4. Pay Mullvad, the exit VPN, the Solana RPC, and Cloudflare with different instruments. Do not use the same email for the exit VPN, the RPC account, and Cloudflare.
 
 ## 2. Make new wallets
 

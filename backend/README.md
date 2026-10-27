@@ -15,7 +15,9 @@ manual CLI send requires an explicit opt-in (see **Safety** below).
   confirm, then sends wECX for that deposit minus 0.00001000 ECX and a 1% fee
   from the treasury's associated token account to the user's Solana address. A recipient
   with no token account pays that account's rent in native coin, 1:1, locked when the order
-  is created.
+  is created. A confirmed deposit that is too small to bridge is sent back to the
+  address it came from, minus the restocking fee. The customer is not asked for a
+  refund address.
 - **Peg-out (wECX → ECX):** a user requests an order and sends wECX to the
   treasury with a Solana Pay reference key; the backend matches the deposit
   by that reference (Solana has no per-order address scheme) and sends ECX
@@ -31,8 +33,9 @@ order page re-checks the order the customer is looking at.
 whose URL contains the order's random id, which is the order's only credential;
 there are no accounts. The page polls every 20 seconds while the order can still
 change, shows the steps the order goes through with the current one marked,
-counts deposit confirmations toward `ECX_DEPOSIT_MIN_CONFS`, states why a deposit
-is being refunded (`refund_reason`), links every transaction id to a block
+counts deposit confirmations toward `ECX_DEPOSIT_MIN_CONFS`, and if a deposit cannot
+be bridged tells the customer it was formatted wrong and sends it back to the address
+it came from, minus the restocking fee (`refund_reason`). It links every transaction id to a block
 explorer (`ECX_EXPLORER_TX_URL`, derived from the Esplora URL by default, and
 `SOLANA_EXPLORER_TX_URL`, Solscan by default; set either empty for bare ids),
 and offers the link itself as a copy button and a QR code for moving between
@@ -73,6 +76,8 @@ a local SQLite database file.
      `cargo run -- solana-keygen` (prints the key and address, stores
      nothing).
    - `WECX_MINT_ADDRESS`
+   - `SOLANA_RPC_URL` — required once `ALLOW_LIVE_PAYOUTS=1`. A paid HTTPS
+     mainnet URL. The public Solana RPC is refused. See `deploy/edge/solana-rpc.md`.
 2. `cargo build`
 3. `cargo run -- serve` to start the HTTP API (default `127.0.0.1:3000`).
 
@@ -95,8 +100,9 @@ inspection (`address`, `balance`, `utxos`, `sync`), manual sends
   of it: the frontend allows eight order requests per minute per client address,
   and a Cloudflare rate limiting rule (see `deploy/edge/cloudflare.md`) refuses
   floods before they reach the tunnel. `ORDERS_PER_MINUTE` (default 120, `0`
-  disables) is only a backstop sized to keep a burst within the public Solana
-  RPC's allowance; legitimate traffic should never reach it. Sustained creation
+  disables) is only a backstop. A live bridge must use a paid Solana RPC (see
+  `deploy/edge/solana-rpc.md`); the public endpoint is refused when payouts are on.
+  Legitimate traffic should never reach the backstop. Sustained creation
   is capped by how many orders may be open at once (`MAX_PENDING_ORDERS`); there
   is no shared daily quota, because exhausting one would refuse every customer.
 - `earnings.toml`'s `ecx_owner_address` must not belong to the hot wallet. The

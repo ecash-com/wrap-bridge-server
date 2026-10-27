@@ -7,7 +7,8 @@ use bdk_electrum::{electrum_client, BdkElectrumClient};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_file_store::Store;
 use bdk_wallet::bitcoin::absolute::LockTime;
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, ScriptBuf, Transaction, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use bdk_wallet::error::CreateTxError;
 use bdk_wallet::chain::spk_client::SyncRequest;
 use bdk_wallet::{Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet};
 
@@ -595,6 +596,107 @@ impl ChainWallet {
         Ok(())
     }
 
+    /// Address that contributed the most value to `txids`, skipping this wallet's own addresses.
+    /// A refund goes there. Address reuse is intentional: the deposit's inputs are the only
+    /// place the coins can be sent back to without asking the customer for a destination.
+    pub async fn funding_address(&self, txids: &[Txid]) -> Result<Address> {
+        let mut seen = std::collections::HashSet::new();
+        let mut contributions = Vec::new();
+        for txid in txids {
+            if !seen.insert(*txid) {
+                continue;
+            }
+            contributions.extend(self.input_contributions(*txid).await?);
+        }
+        let best = dominant_return_address(&contributions, |address| {
+            address
+                .parse::<Address<_>>()
+                .ok()
+                .and_then(|parsed| parsed.require_network(Network::Bitcoin).ok())
+                .is_some_and(|parsed| self.owns_address(&parsed))
+        })
+        .ok_or_else(|| anyhow!("could not determine the address this deposit came from"))?;
+        Ok(best.parse::<Address<_>>()?.require_network(Network::Bitcoin)?)
+    }
+
+    /// Signs a refund that spends only `outpoints` (the deposit) and pays `send_sat` to `to`.
+    /// The rest, after the network fee, is change and stays in this wallet: that is the
+    /// restocking fee. The caller waits until the deposit is confirmed before asking for this.
+    /// Other treasury coins are not added: if the deposit is replaced, this transaction dies
+    /// with it instead of spending the float.
+    ///
+    /// Returns the transaction and the amount actually paid to `to`. If `send_sat` does not
+    /// leave enough for the network fee, the payment is reduced until the deposit can cover it.
+    pub fn prepare_return_from_deposits(
+        &mut self,
+        to: &Address,
+        outpoints: &[OutPoint],
+        send_sat: u64,
+        fee_rate: FeeRate,
+    ) -> Result<(Transaction, u64)> {
+        ensure!(!outpoints.is_empty(), "deposit outputs are not spendable yet");
+        let dust = 546u64;
+        let mut send = send_sat;
+        let mut last_err = None;
+        for _ in 0..12 {
+            if send < dust {
+                break;
+            }
+            let mut builder = self.inner.build_tx();
+            builder
+                .add_utxos(outpoints)
+                .map_err(|e| anyhow!("deposit output is not spendable yet: {e}"))?;
+            builder.manually_selected_only();
+            builder.add_recipient(to.script_pubkey(), Amount::from_sat(send));
+            builder.fee_rate(fee_rate);
+            match builder.finish() {
+                Ok(mut psbt) => {
+                    ensure!(self.inner.sign(&mut psbt, SignOptions::default())?, "failed to sign refund");
+                    self.inner.persist(&mut self.store)?;
+                    let tx = psbt.extract_tx()?;
+                    let sent = tx
+                        .output
+                        .iter()
+                        .filter(|output| output.script_pubkey == to.script_pubkey())
+                        .map(|output| output.value.to_sat())
+                        .sum();
+                    return Ok((tx, sent));
+                }
+                Err(error @ CreateTxError::CoinSelection(_))
+                | Err(error @ CreateTxError::FeeRateTooLow { .. })
+                | Err(error @ CreateTxError::FeeTooLow { .. })
+                | Err(error @ CreateTxError::OutputBelowDustLimit(_)) => {
+                    last_err = Some(error.to_string());
+                    send = send.saturating_sub(200);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(anyhow!(
+            "{}",
+            last_err.unwrap_or_else(|| "refund could not be built from the deposit".to_string())
+        ))
+    }
+
+    /// Satoshis of `tx` that pay this wallet. That is the restocking fee left after a return,
+    /// not the network fee.
+    pub fn change_value(&self, tx: &Transaction) -> u64 {
+        tx.output
+            .iter()
+            .filter_map(|output| {
+                let address = Address::from_script(&output.script_pubkey, Network::Bitcoin).ok()?;
+                self.owns_address(&address).then_some(output.value.to_sat())
+            })
+            .sum()
+    }
+
+    async fn input_contributions(&self, txid: Txid) -> Result<Vec<(String, u64)>> {
+        match &self.client {
+            Client::Esplora { base_url, .. } => esplora_input_contributions(base_url, txid).await,
+            Client::Electrum(client) => electrum_input_contributions(client, txid),
+        }
+    }
+
     /// Confirmation depth of `txid` from the wallet's own synced state (0 if unconfirmed or
     /// unknown). Call `sync()` first to refresh - this doesn't hit the network itself, so it
     /// works identically regardless of which backend is configured.
@@ -711,6 +813,92 @@ fn print_tx_details(tx: &Transaction) {
     println!("--- end tx details ---");
 }
 
+/// The address that paid the most across `contributions` of `(address, satoshis)`, skipping
+/// addresses `is_own` accepts. Sums repeated addresses. `None` when every input was ours, missing,
+/// or empty.
+fn dominant_return_address(
+    contributions: &[(String, u64)],
+    is_own: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut totals: HashMap<&str, u64> = HashMap::new();
+    for (address, value) in contributions {
+        if *value == 0 || is_own(address) {
+            continue;
+        }
+        let total = totals.entry(address.as_str()).or_insert(0);
+        *total = total.saturating_add(*value);
+    }
+    totals
+        .into_iter()
+        .max_by_key(|(_, value)| *value)
+        .map(|(address, _)| address.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraPrevout {
+    scriptpubkey_address: Option<String>,
+    value: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraVin {
+    prevout: Option<EsploraPrevout>,
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraTx {
+    vin: Vec<EsploraVin>,
+}
+
+async fn esplora_input_contributions(base_url: &str, txid: Txid) -> Result<Vec<(String, u64)>> {
+    let url = format!("{}/tx/{txid}", base_url.trim_end_matches('/'));
+    let tx: EsploraTx = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("esplora transaction request failed for {txid}"))?
+        .error_for_status()
+        .with_context(|| format!("esplora has no transaction {txid}"))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse esplora transaction {txid}"))?;
+    Ok(tx
+        .vin
+        .into_iter()
+        .filter_map(|input| {
+            let prevout = input.prevout?;
+            let address = prevout.scriptpubkey_address?;
+            Some((address, prevout.value))
+        })
+        .collect())
+}
+
+fn electrum_input_contributions(
+    client: &BdkElectrumClient<electrum_client::Client>,
+    txid: Txid,
+) -> Result<Vec<(String, u64)>> {
+    use bdk_electrum::electrum_client::ElectrumApi;
+    let tx = client
+        .inner
+        .transaction_get(&txid)
+        .with_context(|| format!("electrum transaction request failed for {txid}"))?;
+    let mut contributions = Vec::new();
+    for input in &tx.input {
+        let prev = match client.inner.transaction_get(&input.previous_output.txid) {
+            Ok(prev) => prev,
+            Err(_) => continue,
+        };
+        let Some(output) = prev.output.get(input.previous_output.vout as usize) else {
+            continue;
+        };
+        let Ok(address) = Address::from_script(&output.script_pubkey, Network::Bitcoin) else {
+            continue;
+        };
+        contributions.push((address.to_string(), output.value.to_sat()));
+    }
+    Ok(contributions)
+}
+
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
@@ -752,5 +940,25 @@ mod ownership_tests {
 
         drop(wallet);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn return_address_is_the_largest_input_that_is_not_ours() {
+        let contributions = vec![
+            ("bc1qours".to_string(), 50_000),
+            ("bc1qsmall".to_string(), 1_000),
+            ("bc1qsmall".to_string(), 2_000),
+            ("bc1qlarge".to_string(), 9_000),
+        ];
+        assert_eq!(
+            dominant_return_address(&contributions, |address| address == "bc1qours").as_deref(),
+            Some("bc1qlarge")
+        );
+        assert_eq!(
+            dominant_return_address(&contributions, |_| true),
+            None,
+            "a deposit funded only by this wallet has nowhere to return it"
+        );
+        assert_eq!(dominant_return_address(&[], |_| false), None);
     }
 }

@@ -80,7 +80,12 @@
 				const refundSteps: Step[] = [
 					steps[0],
 					steps[1],
-					{ label: 'Deposit could not be redeemed', hint: order.depositorOwner ? 'It is being sent back to the wallet it came from.' : 'The operator has to send it back by hand.' },
+					{
+						label: 'Deposit was formatted wrong',
+						hint: order.depositorOwner
+							? 'A restocking fee is kept. The rest goes back to the wallet it came from.'
+							: 'The sending wallet could not be read. The operator has to send it back by hand.'
+					},
 					{ label: `${wrappedTicker()} sent back to the wallet it came from`, hint: 'A Solana transaction, usually under a minute.' }
 				];
 				// The step that went wrong is marked, and the refund that follows is an ordinary step;
@@ -327,11 +332,14 @@
 					{/if}
 				{:else if order.status === 'refund_requested' || order.status === 'refunding'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						This deposit can't be redeemed: it was below the minimum {ecxTicker()} payout.
+						The deposit was formatted wrong.
+						{#if unmatchedDepositFeeFraction != null}
+							A {formatPercent(unmatchedDepositFeeFraction)} restocking fee is kept.
+						{/if}
 					</p>
 					{#if order.depositorOwner}
 						<p class="mt-2 text-center text-xs text-zinc-500">
-							Sending the {wrappedTicker()} back to {order.depositorOwner}…
+							Sending the rest back to {order.depositorOwner}…
 						</p>
 					{:else}
 						<p class="mt-2 text-center text-xs font-medium text-red-600 dark:text-red-400">
@@ -343,12 +351,16 @@
 						<TxLink id={order.depositSignature} baseUrl={solanaExplorerTxUrl} label="View deposit on Solscan" />
 					{/if}
 				{:else if order.status === 'refunded'}
-					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Refunded</p>
-					{#if order.depositorOwner}
-						<p class="mt-2 text-center text-xs text-zinc-500">
-							Your {wrappedTicker()} deposit was sent back to {order.depositorOwner}
-						</p>
-					{/if}
+					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Sent back</p>
+					<p class="mt-2 text-center text-xs text-zinc-500">
+						The deposit was formatted wrong.
+						{#if unmatchedDepositFeeFraction != null}
+							A {formatPercent(unmatchedDepositFeeFraction)} restocking fee was kept.
+						{/if}
+						{#if order.depositorOwner}
+							Returned to {order.depositorOwner}.
+						{/if}
+					</p>
 					{#if order.refundSignature}
 						<TxLink id={order.refundSignature} baseUrl={solanaExplorerTxUrl} label="View refund on Solscan" />
 					{/if}

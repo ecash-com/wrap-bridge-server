@@ -105,8 +105,8 @@
 				const refundSteps: Step[] = [
 					steps[0],
 					steps[1],
-					{ label: 'Deposit could not be wrapped', hint: order.refundAddress ? 'The full deposit is being sent back.' : 'A refund address is needed to send it back.' },
-					{ label: `${ecxTicker()} sent back to your refund address`, hint: 'An ECX transaction; a few minutes.' }
+					{ label: 'Deposit was formatted wrong', hint: 'A restocking fee is kept. The rest goes back to the address it came from.' },
+					{ label: `${ecxTicker()} sent back to the address it came from`, hint: 'An ECX transaction; a few minutes.' }
 				];
 				// The step that went wrong is marked, and the refund that follows is an ordinary step;
 				// once refunded everything is done.
@@ -122,23 +122,7 @@
 	// The page's own address, which is the order's only credential; see OrderLink.
 	let orderUrl = $derived(page.url.href);
 
-	let refundAddressInput = $state('');
-	let refundAddressSubmitting = $state(false);
-	let refundAddressError = $state('');
-
-	// Statuses where a deposit could still plausibly end up refunded, so adding an address is
-	// still useful - matches the backend's `set_refund_address` acceptance check.
-	const REFUND_ADDRESS_SETTABLE_STATUSES = new Set([
-		'pending',
-		'deposit_seen',
-		'deposit_confirmed',
-		'paying_out'
-	]);
-
 	let orderId = $derived(page.params.id ?? '');
-	let canSetRefundAddress = $derived(
-		order != null && !order.refundAddress && REFUND_ADDRESS_SETTABLE_STATUSES.has(order.status)
-	);
 
 	async function fetchOrder() {
 		try {
@@ -198,64 +182,10 @@
 		setTimeout(() => (copied = false), 2000);
 	}
 
-	async function submitRefundAddress() {
-		if (!refundAddressInput.trim()) return;
-		refundAddressSubmitting = true;
-		refundAddressError = '';
-		try {
-			const res = await fetch(`/orders/${encodeURIComponent(orderId)}/refund-address`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ refundAddress: refundAddressInput.trim() })
-			});
-			if (!res.ok) {
-				const err = await res.json().catch(() => ({}));
-				throw new Error((err as { message?: string }).message ?? `Server error ${res.status}`);
-			}
-			refundAddressInput = '';
-			await fetchOrder();
-		} catch (e: unknown) {
-			refundAddressError = e instanceof Error ? e.message : 'Failed to set refund address';
-		} finally {
-			refundAddressSubmitting = false;
-		}
-	}
-
 	function amountOut(order: Order): string {
 		return wecxDecimals != null ? formatBaseUnits(order.amountOutBaseUnits, wecxDecimals) : '…';
 	}
 </script>
-
-{#snippet refundAddressForm()}
-	<div class="mt-4 rounded-xl bg-zinc-100 p-4 dark:bg-zinc-800/60">
-		<label
-			for="refund-address"
-			class="mb-2 block text-xs font-medium text-zinc-600 dark:text-zinc-400"
-		>
-			Add a refund address on {ecxTicker()} (betanet)
-		</label>
-		<div class="flex gap-2">
-			<input
-				id="refund-address"
-				type="text"
-				bind:value={refundAddressInput}
-				placeholder="Address to refund to if needed"
-				disabled={refundAddressSubmitting}
-				class="w-0 flex-1 rounded-lg border border-zinc-300 bg-white px-2.5 py-2 font-mono text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:outline-none disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-			/>
-			<button
-				onclick={submitRefundAddress}
-				disabled={refundAddressSubmitting || !refundAddressInput.trim()}
-				class="shrink-0 rounded-lg bg-zinc-200 px-3 py-2 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-300 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
-			>
-				Save
-			</button>
-		</div>
-		{#if refundAddressError}
-			<p class="mt-2 text-xs font-medium text-red-600 dark:text-red-400">{refundAddressError}</p>
-		{/if}
-	</div>
-{/snippet}
 
 <div class="flex min-h-screen items-center justify-center bg-zinc-50 px-4 py-12 dark:bg-zinc-950">
 	<div class="w-full max-w-sm">
@@ -367,9 +297,6 @@
 					<p class="mt-4 text-center text-xs text-zinc-600">
 						This page checks for your deposit every 20 seconds and updates once it is detected.
 					</p>
-					{#if canSetRefundAddress}
-						{@render refundAddressForm()}
-					{/if}
 				{:else if order.status === 'deposit_seen'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
 						Deposit seen — {confirmationText.toLowerCase()}
@@ -377,18 +304,12 @@
 					{#if order.depositTxid}
 						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
 					{/if}
-					{#if canSetRefundAddress}
-						{@render refundAddressForm()}
-					{/if}
 				{:else if order.status === 'deposit_confirmed' || order.status === 'paying_out'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
 						Deposit confirmed — sending your {wrappedTicker()} now…
 					</p>
 					{#if order.depositTxid}
 						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
-					{/if}
-					{#if canSetRefundAddress}
-						{@render refundAddressForm()}
 					{/if}
 				{:else if order.status === 'paid_out'}
 					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">
@@ -402,29 +323,26 @@
 					{/if}
 				{:else if order.status === 'refund_requested' || order.status === 'refunding'}
 					<p class="text-center text-sm text-zinc-700 dark:text-zinc-300">
-						This deposit can't be wrapped{order.refundReason ? `: ${order.refundReason}` : ''}.
+						{order.refundReason || 'The deposit was formatted wrong.'}
 					</p>
-					{#if order.refundAddress}
-						<p class="mt-2 text-center text-xs text-zinc-500">
-							Sending the full deposit back to {order.refundAddress}…
-						</p>
-					{:else}
-						<p class="mt-2 text-center text-xs font-medium text-red-600 dark:text-red-400">
-							No refund address is on file, so the refund cannot be sent. Add one below and it goes out
-							on the next check.
-						</p>
-						{@render refundAddressForm()}
-					{/if}
+					<p class="mt-2 text-center text-xs text-zinc-500">
+						{#if order.refundAddress}
+							Sending the rest back to {order.refundAddress}…
+						{:else}
+							Sending the rest back to the address it came from…
+						{/if}
+					</p>
 					{#if order.depositTxid}
 						<TxLink id={order.depositTxid} baseUrl={ecxExplorerTxUrl} label="View deposit on explorer" />
 					{/if}
 				{:else if order.status === 'refunded'}
-					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Refunded</p>
-					{#if order.refundAddress}
-						<p class="mt-2 text-center text-xs text-zinc-500">
-							Your {ecxTicker()} deposit was sent back to {order.refundAddress}
-						</p>
-					{/if}
+					<p class="text-center text-sm font-medium text-green-600 dark:text-green-400">Sent back</p>
+					<p class="mt-2 text-center text-xs text-zinc-500">
+						{order.refundReason || 'The deposit was formatted wrong.'}
+						{#if order.refundAddress}
+							Returned to {order.refundAddress}.
+						{/if}
+					</p>
 					{#if order.refundTxid}
 						<TxLink id={order.refundTxid} baseUrl={ecxExplorerTxUrl} label="View refund on explorer" />
 					{/if}

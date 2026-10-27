@@ -84,8 +84,10 @@ deposit is recognized as funding rather than a stray customer transfer.
 **Orders by state.** `pending` is waiting for a deposit (15 minutes, then `expired`);
 `deposit_seen` is waiting for confirmations; `deposit_confirmed` and `paying_out` are being paid
 (a large or growing count here with payouts on means the payer is blocked: check SOL, then the
-journal); `paid_out`, `refunded`, `expired`, `failed` are final. `refund_requested` with no refund
-address waits for the customer to add one.
+journal); `paid_out`, `refunded`, `expired`, `failed` are final. `refund_requested` is a deposit that
+was formatted wrong. It is sent back to the address it came from, minus the restocking fee,
+without anyone typing an address. If the log says the sending address could not be read, that
+one needs a person.
 
 **Unmatched deposits.** Wrapped-token transfers that reached the treasury with no order reference.
 `pending`/`refunding` go back automatically minus the fee. `held` need a person: list them with
@@ -101,7 +103,7 @@ address waits for the customer to add one.
 | `treasury SOL balance ... below TREASURY_MIN_SOL_LAMPORTS` | Not enough SOL for fees and rent | Send SOL to the treasury address |
 | `insufficient wECX liquidity` / `insufficient ECX liquidity` | Customers want more than the float | Top up the treasury, or wait for the other direction |
 | `payout ... has an UNKNOWN outcome` | The RPC stopped answering mid-send | Nothing: the resolver settles it within minutes. Never retry by hand |
-| `lost contact with the Solana RPC` | The RPC endpoint is down or rate limiting | Wait, or set a paid `SOLANA_RPC_URL` |
+| `lost contact with the Solana RPC` | The paid RPC endpoint is down or rate limiting | Wait, or check the provider. Do not switch this machine to the public Solana RPC |
 | `esplora` or `explorer` errors | The ECX explorer is down | Wait; deposits are detected when it returns |
 | `[unmatched] ... held` | A stray deposit needs a decision | See unmatched deposits above |
 

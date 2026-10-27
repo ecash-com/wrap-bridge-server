@@ -62,7 +62,7 @@ Do not put a Cloudflare Access policy in front of this hostname. Access would de
 The bridge takes orders without a login, so the only thing that separates one customer from a flood is the address Cloudflare saw. The frontend allows eight order requests per minute per address, and the backend refuses everything above about two orders per second in total. Both run after the request has crossed the tunnel. Cloudflare can refuse earlier, before the tunnel, and the Free plan includes one rate limiting rule. Use it.
 
 1. In the zone, go to **Security** > **WAF** > **Rate limiting rules**, then **Create rule**.
-2. Match requests whose method is `POST` and whose URI path ends with `/orders` or `/refund-address`. Those are the only requests that create work for the bridge.
+2. Match requests whose method is `POST` and whose URI path ends with `/orders`. Those are the only requests that create an order.
 3. Count by IP. Set the rate to the lowest the plan offers, such as 10 requests in 10 seconds, and the action to **Block**.
 4. Leave `GET` requests alone. Customers poll their order page, and the backend already spaces out the chain lookups those polls can trigger.
 

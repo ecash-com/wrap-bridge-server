@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS bridge_orders (
     -- the required count. Not authoritative: the status transition is decided from the wallet.
     deposit_confirmations INTEGER NOT NULL DEFAULT 0 CHECK (deposit_confirmations >= 0),
     -- Why a refund was requested, for the customer. Empty until then.
-    refund_reason TEXT NOT NULL DEFAULT ''
+    refund_reason TEXT NOT NULL DEFAULT '',
+    -- Restocking fee kept when a formatted-wrong wrap is sent back, in sat. 0 until then.
+    refund_fee_sat INTEGER NOT NULL DEFAULT 0 CHECK (refund_fee_sat >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS bridge_orders_status_idx ON bridge_orders (status);
@@ -74,9 +76,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS bridge_orders_deposit_address_uidx
 -- told apart by a `reference_pubkey` - a bare pubkey generated per order with no keypair kept,
 -- included as an extra account in the customer's transfer per the Solana Pay convention (see
 -- solana::SolanaWallet::find_reference_deposit). `depositor_owner` is extracted from that same
--- transaction (its wECX balance decreased) rather than asked of the customer, so - unlike
--- bridge_orders.refund_address - peg-out orders never need a separate add-a-refund-destination
--- step.
+-- transaction (its wECX balance decreased) rather than asked of the customer. A formatted-wrong
+-- deposit is sent back to that wallet. Wrap refunds do the same from the ECX deposit's inputs.
 CREATE TABLE IF NOT EXISTS pegout_order_statuses (
     code TEXT PRIMARY KEY
 );
@@ -104,7 +105,9 @@ CREATE TABLE IF NOT EXISTS pegout_orders (
     payout_txid TEXT,
     refund_signature TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    -- Restocking fee kept when a formatted-wrong unwrap is sent back. 0 until then.
+    refund_fee_base_units INTEGER NOT NULL DEFAULT 0 CHECK (refund_fee_base_units >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS pegout_orders_status_idx ON pegout_orders (status);
@@ -298,10 +301,29 @@ impl Connection {
         .await?;
         self.ensure_column("bridge_orders", "deposit_confirmations", "INTEGER NOT NULL DEFAULT 0").await?;
         self.ensure_column("bridge_orders", "refund_reason", "TEXT NOT NULL DEFAULT ''").await?;
+        self.ensure_column("bridge_orders", "refund_fee_sat", "INTEGER NOT NULL DEFAULT 0").await?;
+        self.ensure_column(
+            "pegout_orders",
+            "refund_fee_base_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
         Ok(())
     }
 
     async fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        // Older databases (and the migration fixture) may predate a later table. Schema creation
+        // adds that table with the column already present; there is nothing to alter until then.
+        let mut existing = self
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                (table,),
+            )
+            .await
+            .with_context(|| format!("failed to look up {table}"))?;
+        if existing.next().await?.is_none() {
+            return Ok(());
+        }
         let mut rows = self
             .query(&format!("PRAGMA table_info({table})"), ())
             .await
@@ -384,11 +406,9 @@ pub struct Order {
     pub amount_out_base_units: i64,
     pub deposit_address: String,
     pub solana_recipient: String,
-    /// Where the ECX deposit gets sent back if it can't be bridged (currently: a repriced deposit
-    /// that rounds to zero wECX - see `server::detect_deposit`). `None` if the customer didn't
-    /// provide one at creation. Stored as `TEXT NOT NULL DEFAULT ''` (empty string means "not
-    /// provided") rather than a nullable column, mapped to `Option` at this boundary - see
-    /// `row_to_order`/`insert_order`.
+    /// Address the deposit came from, filled by the server when a formatted-wrong deposit is sent
+    /// back. Never chosen by the customer. `None` until that address has been read from the
+    /// deposit. Stored as `TEXT NOT NULL DEFAULT ''` (empty string means "not yet known").
     pub refund_address: Option<String>,
     pub status: String,
     pub deposit_txid: Option<String>,
@@ -418,7 +438,6 @@ pub struct NewOrder {
     pub amount_out_base_units: u64,
     pub deposit_address: String,
     pub solana_recipient: String,
-    pub refund_address: Option<String>,
     pub sol_stipend_lamports: u64,
     pub sol_stipend_price_sat: u64,
     pub ata_rent_lamports: u64,
@@ -483,7 +502,7 @@ pub async fn insert_order(conn: &Connection, order: &NewOrder) -> Result<Order> 
             amount_out_base_units,
             order.deposit_address.as_str(),
             order.solana_recipient.as_str(),
-            order.refund_address.as_deref().unwrap_or(""),
+            "",
             sol_stipend_lamports,
             sol_stipend_price_sat,
             ata_rent_lamports,
@@ -1012,9 +1031,8 @@ pub async fn revert_claim(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Routes a `deposit_confirmed` order to a refund instead of a payout - currently only used when a
-/// deposit reprices to zero wECX (see `server::detect_deposit`). Returns `true` iff this call won
-/// the transition.
+/// Routes a confirmed deposit to a refund instead of a payout. The reason is the sentence shown
+/// to the customer. Returns `true` iff this call won the transition.
 pub async fn request_refund(conn: &Connection, id: &str, reason: &str) -> Result<bool> {
     let rows_affected = conn
         .execute(
@@ -1032,10 +1050,8 @@ pub async fn request_refund(conn: &Connection, id: &str, reason: &str) -> Result
     Ok(rows_affected > 0)
 }
 
-/// Sets `refund_address` for an order that doesn't have one yet - conditional on the column still
-/// being empty (see `row_to_order`'s `''` = "not provided" convention) so this can't clobber an
-/// address already on file, whether from order creation or a prior call here racing this one.
-/// Returns `true` iff this call won the write.
+/// Records the address a refund will be sent to. Only fills a blank, so two polls cannot replace
+/// a destination already chosen from the deposit. Returns `true` iff this call won the write.
 pub async fn set_refund_address(conn: &Connection, id: &str, refund_address: &str) -> Result<bool> {
     let rows_affected = conn
         .execute(
@@ -1067,15 +1083,59 @@ pub async fn claim_for_refund(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows_affected > 0)
 }
 
-/// Marks a claimed order as refunded with its ECX refund txid.
-pub async fn update_refund(conn: &Connection, id: &str, refund_txid: &str) -> Result<()> {
+/// Marks a claimed order as refunded with its ECX refund txid and the fee kept in this wallet.
+pub async fn update_refund(conn: &Connection, id: &str, refund_txid: &str, fee_sat: u64) -> Result<()> {
     conn.execute(
-        "UPDATE bridge_orders SET status = ?, refund_txid = ?, updated_at = unixepoch() WHERE id = ?",
-        (OrderStatus::Refunded.label(), refund_txid, id),
+        "UPDATE bridge_orders SET status = ?, refund_txid = ?, refund_fee_sat = ?, \
+         updated_at = unixepoch() WHERE id = ? AND status = ?",
+        (
+            OrderStatus::Refunded.label(),
+            refund_txid,
+            to_i64(fee_sat)?,
+            id,
+            OrderStatus::Refunding.label(),
+        ),
     )
     .await
     .context("failed to update bridge order refund")?;
     Ok(())
+}
+
+/// The deposit was too small to send back after the restocking fee. Keeps it and closes the order.
+/// Returns `true` iff the order was still `refund_requested`.
+pub async fn finish_refund_kept(conn: &Connection, id: &str, fee_sat: u64, reason: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE bridge_orders SET status = ?, refund_fee_sat = ?, refund_reason = ?, \
+             updated_at = unixepoch() WHERE id = ? AND status = ?",
+            (
+                OrderStatus::Refunded.label(),
+                to_i64(fee_sat)?,
+                reason,
+                id,
+                OrderStatus::RefundRequested.label(),
+            ),
+        )
+        .await
+        .context("failed to keep a wrap refund as the fee")?;
+    Ok(rows > 0)
+}
+
+/// Restocking fees kept on completed wrap refunds, as `(fee, 0)` so they add into wrap-side
+/// earnings the same way completed orders do.
+pub async fn wrap_restocking_fees(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT refund_fee_sat FROM bridge_orders WHERE status = ? AND refund_fee_sat > 0",
+            (OrderStatus::Refunded.label(),),
+        )
+        .await
+        .context("failed to query wrap restocking fees")?;
+    let mut fees = Vec::new();
+    while let Some(row) = rows.next().await? {
+        fees.push((u64::try_from(row.get::<i64>(0)?)?, 0));
+    }
+    Ok(fees)
 }
 
 /// Reverts a `refunding` claim back to `refund_requested` so the next poll retries - used when the
@@ -1120,8 +1180,8 @@ pub enum PegoutOrderStatus {
     Expired,
     Failed,
     /// Deposit confirmed but not worth paying out (see `server::pegout_payout_viable`) - routed to
-    /// a wECX refund using the `depositor_owner` extracted from the deposit transaction itself, so
-    /// (unlike `bridge_orders.refund_address`) no customer input is needed to reach this state.
+    /// a wECX refund using the `depositor_owner` extracted from the deposit transaction itself.
+    /// The customer is not asked for a destination.
     RefundRequested,
     /// Transitional claim state while a wECX refund send is in flight - mirrors
     /// `OrderStatus::Refunding`. This one *is* two-phase like the peg-in payout (see
@@ -1517,15 +1577,22 @@ pub async fn record_pegout_refund_signature(conn: &Connection, id: &str, refund_
     Ok(rows_affected > 0)
 }
 
-/// Marks a claimed refund as sent. Conditional on the order still being `refunding`.
-pub async fn update_pegout_refund(conn: &Connection, id: &str, refund_signature: &str) -> Result<bool> {
+/// Marks a claimed refund as sent and records the restocking fee kept. Conditional on the order
+/// still being `refunding`.
+pub async fn update_pegout_refund(
+    conn: &Connection,
+    id: &str,
+    refund_signature: &str,
+    fee_base_units: u64,
+) -> Result<bool> {
     let rows_affected = conn
         .execute(
-            "UPDATE pegout_orders SET status = ?, refund_signature = ?, updated_at = unixepoch() \
-             WHERE id = ? AND status = ?",
+            "UPDATE pegout_orders SET status = ?, refund_signature = ?, refund_fee_base_units = ?, \
+             updated_at = unixepoch() WHERE id = ? AND status = ?",
             (
                 PegoutOrderStatus::Refunded.label(),
                 refund_signature,
+                to_i64(fee_base_units)?,
                 id,
                 PegoutOrderStatus::Refunding.label(),
             ),
@@ -1533,6 +1600,40 @@ pub async fn update_pegout_refund(conn: &Connection, id: &str, refund_signature:
         .await
         .context("failed to update pegout order refund")?;
     Ok(rows_affected > 0)
+}
+
+/// The unwrap deposit was too small to send back after the restocking fee. Keeps it.
+pub async fn finish_pegout_refund_kept(conn: &Connection, id: &str, fee_base_units: u64) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE pegout_orders SET status = ?, refund_fee_base_units = ?, updated_at = unixepoch() \
+             WHERE id = ? AND status = ?",
+            (
+                PegoutOrderStatus::Refunded.label(),
+                to_i64(fee_base_units)?,
+                id,
+                PegoutOrderStatus::RefundRequested.label(),
+            ),
+        )
+        .await
+        .context("failed to keep a pegout refund as the fee")?;
+    Ok(rows > 0)
+}
+
+/// Restocking fees kept on completed unwrap refunds, as `(fee, 0)` for unwrap-side earnings.
+pub async fn pegout_restocking_fees(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT refund_fee_base_units FROM pegout_orders WHERE status = ? AND refund_fee_base_units > 0",
+            (PegoutOrderStatus::Refunded.label(),),
+        )
+        .await
+        .context("failed to query pegout restocking fees")?;
+    let mut fees = Vec::new();
+    while let Some(row) = rows.next().await? {
+        fees.push((u64::try_from(row.get::<i64>(0)?)?, 0));
+    }
+    Ok(fees)
 }
 
 /// Mirrors `revert_refund_claim`.

@@ -318,7 +318,7 @@ impl SolanaWallet {
     /// Looks for a wECX deposit into the treasury's ATA whose transaction includes `reference` as
     /// one of its account keys - the Solana Pay "reference key" convention this bridge's peg-out
     /// (wECX->ECX) direction uses to tell orders apart, since (unlike ECX) there's no way to hand
-    /// out a fresh receive *address* per order on Solana (see PLAN.md phase 2). `reference` is a
+    /// out a fresh receive *address* per order on Solana. `reference` is a
     /// bare pubkey generated per order (see `server::create_pegout_order`) with no keypair kept -
     /// it's never a signer, only an extra readonly account included in the customer's transfer
     /// instruction for this lookup to find.

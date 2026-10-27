@@ -1,6 +1,6 @@
 # swap-frontend
 
-SvelteKit UI for the ECX ↔ wECX bridge. Talks to [swap-backend](https://github.com/marcusmmmz/ecx-swap-backend)
+SvelteKit UI for the ECX ↔ wECX bridge. Talks to the Rust backend in [../backend](../backend)
 over its HTTP API; server routes under `src/routes/` proxy requests to the
 backend so the backend URL is never exposed to the browser.
 

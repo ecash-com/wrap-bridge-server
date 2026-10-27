@@ -44,8 +44,6 @@ export const GET: RequestHandler = async ({ url }) => {
 			amountOutBaseUnits: data.amount_out_base_units,
 			peginFeeFraction: data.pegin_fee_bps / 10_000,
 			peginFlatFeeSat: data.pegin_flat_fee_sat,
-			// Peg-out itself isn't built in the frontend yet - carried through for when it is,
-			// not rendered anywhere right now.
 			pegoutFeeFraction: data.pegout_fee_bps / 10_000,
 			wecxDecimals: data.wecx_decimals,
 			minAmountIn: data.min_amount_in_sat / UNIT_SCALE,

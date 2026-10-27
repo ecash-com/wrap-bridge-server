@@ -117,9 +117,9 @@ impl ChainConfig {
     /// hash matches mainnet's exactly), so it uses the same `Network::Bitcoin` address/key
     /// encoding BTC mainnet does - see src/keys.rs.
     ///
-    /// betanet is the network this repo targets (see CLAUDE.md - drynet4 is an older, different
-    /// network this repo does not use anymore). Both betanet and Bitcoin mainnet are real money
-    /// (see CLAUDE.md) - there is no test network to develop against, so every send here is real.
+    /// betanet is the network this repo targets. drynet4 is an older, different network this repo
+    /// does not use anymore. Both betanet and Bitcoin mainnet are real money. There is no test
+    /// network to develop against, so every send here is real.
     pub fn ecx() -> Self {
         let data_dir = data_dir();
         // Public betanet infra has been flaky in the past (address indexer 500s, esplora.* host
@@ -397,10 +397,9 @@ pub fn pegout_fee_bps() -> u64 {
     fee_bps("PEGOUT_FEE_BPS", 100)
 }
 
-/// Fee kept from a wECX deposit that reached the treasury without any order's reference key, in
-/// basis points, from `UNMATCHED_DEPOSIT_FEE_BPS` (default 100 = 1%). The rest is sent back to the
-/// wallet it came from - see `server::scan_unmatched_deposits_once`. The fee covers the refund's
-/// network cost and discourages using the treasury as a free round trip.
+/// Restocking fee, in basis points, from `UNMATCHED_DEPOSIT_FEE_BPS` (default 100 = 1%). Kept when
+/// a deposit is sent back: a wrap or unwrap that was formatted wrong, and a wECX transfer that
+/// reached the treasury with no order reference. The rest goes to the address the coins came from.
 pub fn unmatched_deposit_fee_bps() -> u64 {
     fee_bps("UNMATCHED_DEPOSIT_FEE_BPS", 100)
 }
@@ -434,18 +433,61 @@ fn fee_bps(var: &str, default: u64) -> u64 {
 
 /// Whether the server is allowed to automatically broadcast live payouts/refunds: the ECX refund
 /// send and the wECX treasury payout on Solana. Both betanet ECX and Solana mainnet-beta are real
-/// money (see CLAUDE.md), so - unlike the old swap's BTC-only mainnet gate - this covers every
-/// automatic outbound send this backend can make, from `ALLOW_LIVE_PAYOUTS` (default off). This is
-/// the unattended-server equivalent of the CLI's `--confirm-live` flag.
+/// money, so this covers every automatic outbound send this backend can make, from
+/// `ALLOW_LIVE_PAYOUTS` (default off). This is the unattended-server equivalent of the CLI's
+/// `--confirm-live` flag.
 pub fn live_payouts_allowed() -> bool {
     matches!(std::env::var("ALLOW_LIVE_PAYOUTS").as_deref(), Ok("1") | Ok("true"))
 }
 
-/// Solana RPC endpoint, from `SOLANA_RPC_URL` (default the public mainnet-beta RPC, which rate-
-/// limits under real usage - see PLAN.md's open decisions on a production RPC provider).
+/// Solana RPC endpoint, from `SOLANA_RPC_URL`. The default is the public mainnet-beta RPC, which
+/// is only for a local run with payouts off. An installed bridge sets a paid URL (see
+/// `deploy/edge/solana-rpc.md`). Live payouts refuse the public endpoint.
 pub fn solana_rpc_url() -> String {
     std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string())
+}
+
+/// Host of an RPC URL, without userinfo, port, or path. `None` when `url` has no scheme.
+pub fn rpc_host(url: &str) -> Option<String> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    Some(host.to_ascii_lowercase())
+}
+
+pub fn is_public_solana_rpc(url: &str) -> bool {
+    matches!(
+        rpc_host(url).as_deref(),
+        Some("api.mainnet-beta.solana.com") | Some("api.devnet.solana.com") | Some("api.testnet.solana.com")
+    )
+}
+
+pub fn reject_public_solana_rpc(url: &str) -> Result<()> {
+    if is_public_solana_rpc(url) {
+        anyhow::bail!(
+            "SOLANA_RPC_URL is a public Solana endpoint. Buy a paid RPC and put that URL in \
+             params.conf. See deploy/edge/solana-rpc.md"
+        );
+    }
+    Ok(())
+}
+
+/// `100` basis points is `1%`. Used in the sentence shown when a deposit is sent back.
+pub fn format_fee_percent(bps: u64) -> String {
+    let whole = bps / 100;
+    let frac = bps % 100;
+    if frac == 0 {
+        format!("{whole}%")
+    } else if frac % 10 == 0 {
+        format!("{whole}.{}%", frac / 10)
+    } else {
+        format!("{whole}.{frac:02}%")
+    }
 }
 
 /// Block-explorer page for an ECX transaction, without the trailing `/<txid>`, from
@@ -479,8 +521,8 @@ pub fn solana_keypair() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("SOLANA_KEYPAIR env var not set (base58 64-byte secret key)"))
 }
 
-/// The wECX SPL token mint address, from `WECX_MINT_ADDRESS`. This backend never needs mint
-/// authority over it (see PLAN.md) - only a treasury token account holding a balance of it.
+/// The wECX SPL token mint address, from `WECX_MINT_ADDRESS`. This backend has no mint authority.
+/// It only spends from its own treasury token account.
 pub fn wecx_mint() -> Result<solana_sdk::pubkey::Pubkey> {
     let raw = std::env::var("WECX_MINT_ADDRESS")
         .map_err(|_| anyhow::anyhow!("WECX_MINT_ADDRESS env var not set"))?;
@@ -601,6 +643,17 @@ mod tests {
             std::env::remove_var("ECX_ESPLORA_URL");
         }
         assert_eq!(solana_explorer_tx_url(), "https://solscan.io/tx");
+    }
+
+    #[test]
+    fn public_solana_rpc_is_recognized_and_a_paid_url_is_not() {
+        assert!(is_public_solana_rpc("https://api.mainnet-beta.solana.com"));
+        assert!(is_public_solana_rpc("https://api.mainnet-beta.solana.com/"));
+        assert!(is_public_solana_rpc("https://user:secret@api.devnet.solana.com:8899/path"));
+        assert!(!is_public_solana_rpc("https://mainnet.helius-rpc.com/?api-key=paid"));
+        assert_eq!(format_fee_percent(100), "1%");
+        assert_eq!(format_fee_percent(50), "0.5%");
+        assert_eq!(format_fee_percent(1), "0.01%");
     }
 
     #[test]

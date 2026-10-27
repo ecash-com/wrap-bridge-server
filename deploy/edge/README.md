@@ -10,7 +10,7 @@ Tor is not the recommended hop. A paid VPN with one dedicated address is enough,
 customer → Cloudflare → tunnel from the bridge → the exit VPN's dedicated address → house
 ```
 
-The bridge's default route is the VPN. Cloudflare, Esplora, and Solana all see the dedicated address. The VPN provider still sees the house address. That is the trade for dropping Tor.
+The bridge's default route is the VPN. Cloudflare, Esplora, and the paid Solana RPC all see the dedicated address. The VPN provider still sees the house address. That is the trade for dropping Tor. The Solana RPC is bought separately; see [solana-rpc.md](solana-rpc.md). The public Solana endpoint is refused.
 
 The dedicated address is an exit identity, not a public door. Some dedicated-address products can open inbound ports. This host must not listen on them. Customers enter only through the Cloudflare tunnel.
 
@@ -21,7 +21,7 @@ The dedicated address is an exit identity, not a public door. Some dedicated-add
 | Customer | No, if DNS stays proxied and no old record leaked |
 | Cloudflare | No, while every tunnel packet exits through the VPN |
 | Exit VPN (hop 2) | Yes. They terminate the tunnel from the house |
-| Esplora or Solana | No, if those calls also use the VPN route |
+| Esplora or the paid Solana RPC | No, if those calls also use the VPN route |
 | House ISP | A WireGuard session to the VPN, not the domain |
 
 `swap.beta.ecash.com` already published `172.237.148.99`. Use a new name. An old unproxied record, or a certificate for the public name on the bridge, undoes the rest.

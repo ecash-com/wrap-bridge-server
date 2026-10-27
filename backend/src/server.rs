@@ -124,9 +124,8 @@ struct QuoteResponse {
     /// Fixed ECX amount, in sat, kept on every wrap before the percentage (see
     /// `config::pegin_flat_fee_sat`). Already baked into `amount_out_base_units` above.
     pegin_flat_fee_sat: u64,
-    /// Flat fee that will apply to the wECX->ECX peg-out direction, in basis points (see
-    /// `config::pegout_fee_bps`) - informational only for now, since peg-out itself isn't
-    /// implemented yet (PLAN.md phase 2). Not used in `amount_out_base_units` above.
+    /// Flat fee on the wECX->ECX direction, in basis points (see `config::pegout_fee_bps`).
+    /// Reported here so the form can show both fees. The wrap amount above uses `pegin_fee_bps`.
     pegout_fee_bps: u64,
     /// Decimals of the wECX SPL mint, fetched once at startup (see `SolanaWallet::decimals`).
     wecx_decimals: u8,
@@ -213,6 +212,8 @@ async fn get_stats(
         .await
         .map_err(internal_error)?;
     let unmatched_fees = db::unmatched_deposit_fees(&state.db).await.map_err(internal_error)?;
+    let wrap_restocking = db::wrap_restocking_fees(&state.db).await.map_err(internal_error)?;
+    let pegout_restocking = db::pegout_restocking_fees(&state.db).await.map_err(internal_error)?;
 
     let wrap_fees_sat: u128 = wraps
         .iter()
@@ -221,6 +222,7 @@ async fn get_stats(
                 convert::wecx_base_units_to_ecx_sat(*amount_out_base_units, decimals, 0);
             amount_in_sat.saturating_sub(amount_out_sat) as u128
         })
+        .chain(wrap_restocking.iter().map(|(fee, _)| *fee as u128))
         .sum();
     let unwrap_fees_base_units: u128 = unwraps
         .iter()
@@ -230,6 +232,7 @@ async fn get_stats(
             amount_in_base_units.saturating_sub(amount_out_base_units) as u128
         })
         .chain(unmatched_fees.iter().map(|(fee, _)| *fee as u128))
+        .chain(pegout_restocking.iter().map(|(fee, _)| *fee as u128))
         .sum();
 
     let mut ecx = state.ecx.lock().await;
@@ -323,11 +326,6 @@ struct CreateOrderRequest {
     amount_in_sat: u64,
     /// Solana address the treasury-custodied wECX gets sent to.
     solana_recipient: String,
-    /// ECX address the deposit gets sent back to if it can't be bridged (see
-    /// `db::OrderStatus::RefundRequested`). Optional - an order created without one simply can't
-    /// be refunded: it just sits recorded for manual review instead.
-    #[serde(default)]
-    refund_address: Option<String>,
     /// Wrap only. The customer pays `config::sol_stipend_offer` extra ECX and receives that SOL
     /// with the wrapped tokens. The amount is not chosen by the client.
     #[serde(default)]
@@ -376,22 +374,6 @@ async fn create_order(
         .solana
         .validate_recipient(&recipient)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid solana_recipient: {e}")))?;
-
-    let ecx_network = ChainConfig::ecx().network;
-    let refund_address: Option<Address> = match req.refund_address.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(addr) => Some(
-            addr.parse::<Address<_>>()
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid refund_address: {e}")))?
-                .require_network(ecx_network)
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("refund_address is not a valid {} address: {e}", config::asset_ticker()),
-                    )
-                })?,
-        ),
-    };
 
     let stipend = if req.include_sol_stipend {
         let offer = config::sol_stipend_offer();
@@ -556,7 +538,6 @@ async fn create_order(
             amount_out_base_units: amount_out,
             deposit_address: deposit_address.to_string(),
             solana_recipient: recipient.to_string(),
-            refund_address: refund_address.map(|a| a.to_string()),
             sol_stipend_lamports: stipend.lamports,
             sol_stipend_price_sat: stipend.price_sat,
             ata_rent_lamports,
@@ -593,10 +574,8 @@ async fn check_deposit(state: &AppState, order: db::Order, sync: bool) -> anyhow
 /// `convert::ecx_sat_to_wecx_base_units`) - no customer decision needed.
 ///
 /// If the deposit is below `config::min_deposit_amount()`, or its repriced amount rounds to zero
-/// wECX (a dust deposit, or one small enough that `pegin_fee_bps`/decimal rounding eats it
-/// entirely), this isn't worth paying out or bridging at all (see `payout_viable`): routed
-/// straight to a refund when one's on file, otherwise left recorded for manual review - `try_fulfill`
-/// refuses to pay it out, and `try_refund` takes the same stance on a missing `refund_address`.
+/// wECX, it is not paid out. Once confirmed, it is sent back to the address it came from, minus
+/// the restocking fee. The customer is told the deposit was formatted wrong.
 async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyhow::Result<db::Order> {
     let status = OrderStatus::from_label(&order.status)?;
     if !matches!(status, OrderStatus::Pending | OrderStatus::DepositSeen) {
@@ -702,23 +681,41 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
 
     if new_status == OrderStatus::DepositConfirmed
         && (settled.ata_rent_uncovered || !payout_viable(settled.wrap_sat, amount_out))
-        && updated.refund_address.is_some()
     {
-        let reason = wrap_refund_reason(&settled, amount_out);
+        let detail = wrap_refund_reason(&settled, amount_out);
+        let reason = customer_refund_reason(true);
         eprintln!(
-            "[detect_deposit] order {}: {reason} -> requesting refund",
+            "[detect_deposit] order {}: {detail} -> requesting refund",
             short(&updated.id)
         );
-        if db::request_refund(&state.db, &updated.id, reason).await? {
+        if db::request_refund(&state.db, &updated.id, &reason).await? {
             updated.status = OrderStatus::RefundRequested.label().to_string();
-            updated.refund_reason = reason.to_string();
+            updated.refund_reason = reason;
         }
     }
 
     Ok(updated)
 }
 
-/// Why a landed wrap deposit is being sent back, in words for the customer.
+/// Sentence shown to the customer when a deposit cannot be bridged. The first clause is fixed.
+/// The percentage is the configured restocking fee (`UNMATCHED_DEPOSIT_FEE_BPS`).
+fn customer_refund_reason(sent_back: bool) -> String {
+    let percent = config::format_fee_percent(config::unmatched_deposit_fee_bps());
+    if sent_back {
+        format!(
+            "The deposit was formatted wrong. A {percent} restocking fee is kept and the rest is \
+             sent back to the address it came from."
+        )
+    } else {
+        format!(
+            "The deposit was formatted wrong. After the {percent} restocking fee nothing was left \
+             to send back."
+        )
+    }
+}
+
+/// Why a landed wrap deposit is being sent back, for the log. The customer sees
+/// `customer_refund_reason` instead.
 fn wrap_refund_reason(settled: &convert::SettledWrap, amount_out: u64) -> &'static str {
     if settled.ata_rent_uncovered {
         "the deposit was too small to cover creating the token account for your Solana address"
@@ -822,7 +819,7 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
     }
 
     if !config::live_payouts_allowed() {
-        // Both betanet ECX and Solana mainnet-beta are real money (see CLAUDE.md) - the operator
+        // Both betanet ECX and Solana mainnet-beta are real money - the operator
         // hasn't opted in, so leave this claimable for the next poll once ALLOW_LIVE_PAYOUTS is
         // set (or the operator pays out manually and marks it done out-of-band).
         eprintln!(
@@ -839,15 +836,17 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
              paying out",
             short(&order.id)
         );
-        let reason = wrap_refund_reason(&settled, settled.amount_out_base_units);
-        if order.refund_address.is_some() && db::request_refund(&state.db, &order.id, reason).await? {
+        let detail = wrap_refund_reason(&settled, settled.amount_out_base_units);
+        eprintln!("[try_fulfill] order {}: {detail}", short(&order.id));
+        let reason = customer_refund_reason(true);
+        if db::request_refund(&state.db, &order.id, &reason).await? {
             return Ok(db::Order {
                 status: OrderStatus::RefundRequested.label().to_string(),
-                refund_reason: reason.to_string(),
+                refund_reason: reason,
                 ..order
             });
         }
-        return Ok(order);
+        return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
     }
     if settled.amount_out_base_units != order.amount_out_base_units.max(0) as u64 {
         eprintln!(
@@ -858,11 +857,19 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
     }
     if !payout_viable(settled.wrap_sat, settled.amount_out_base_units) {
         eprintln!(
-            "[try_fulfill] order {}: deposit is below the minimum or reprices to zero wECX - not \
-             paying out, needs manual review/refund",
+            "[try_fulfill] order {}: deposit is below the minimum or reprices to zero wECX - \
+             sending it back",
             short(&order.id)
         );
-        return Ok(order);
+        let reason = customer_refund_reason(true);
+        if db::request_refund(&state.db, &order.id, &reason).await? {
+            return Ok(db::Order {
+                status: OrderStatus::RefundRequested.label().to_string(),
+                refund_reason: reason,
+                ..order
+            });
+        }
+        return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
     }
 
     let sol_lamports = state.solana.sol_balance_lamports().await?;
@@ -1075,9 +1082,13 @@ async fn resubmit_saved_ecx_tx(state: &AppState, tx_hex: &str) -> anyhow::Result
     Ok(txid.to_string())
 }
 
-/// Sends a `refund_requested` order's `amount_in_sat` back to its `refund_address` on ECX. Also
-/// finishes a `refunding` order whose signed transaction was saved before broadcast. A lost
-/// broadcast response retries that same transaction. It does not build a second one.
+/// Sends a `refund_requested` order back to the address the deposit came from, minus the
+/// restocking fee. The destination is read from the deposit's inputs; the customer does not
+/// choose it. Also finishes a `refunding` order whose signed transaction was saved before
+/// broadcast. A lost broadcast response retries that same transaction. It does not build a second
+/// one. The refund spends only the deposit outputs. It is not requested until that deposit has
+/// the required confirmations, so a later payment to the same address can still be included.
+/// A replaced deposit takes the refund with it instead of spending the float.
 async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Order> {
     let status = OrderStatus::from_label(&order.status)?;
     if !matches!(status, OrderStatus::RefundRequested | OrderStatus::Refunding) {
@@ -1088,8 +1099,10 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     }
 
     if let Some(tx_hex) = db::outbound_tx_hex(&state.db, &order.id, WRAP_REFUND_TX).await? {
+        let tx = decode_sweep_transaction(&tx_hex)?;
         let refund_txid = resubmit_saved_ecx_tx(state, &tx_hex).await?;
-        db::update_refund(&state.db, &order.id, &refund_txid).await?;
+        let fee_sat = state.ecx.lock().await.change_value(&tx);
+        db::update_refund(&state.db, &order.id, &refund_txid, fee_sat).await?;
         return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(db::Order {
             status: OrderStatus::Refunded.label().to_string(),
             refund_txid: Some(refund_txid),
@@ -1104,45 +1117,69 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
         return Ok(order);
     }
 
+    let destination = match return_address(state, &order).await {
+        Ok(address) => address,
+        Err(e) => {
+            eprintln!(
+                "[try_refund] order {}: cannot yet read the address this deposit came from: {e:#}",
+                short(&order.id)
+            );
+            return Ok(order);
+        }
+    };
+    if order.refund_address.as_deref() != Some(destination.to_string().as_str())
+        && !db::set_refund_address(&state.db, &order.id, &destination.to_string()).await?
+    {
+        return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
+    }
+
+    let amount_in = order.amount_in_sat.max(0) as u64;
+    let (_fee, refund_sat) = convert::unmatched_refund_split(amount_in, config::unmatched_deposit_fee_bps());
+    if refund_sat == 0 || refund_sat < config::min_deposit_amount().to_sat() {
+        let reason = customer_refund_reason(false);
+        eprintln!(
+            "[try_refund] order {}: refund of {refund_sat} sat is below the minimum - keeping the deposit",
+            short(&order.id)
+        );
+        if db::finish_refund_kept(&state.db, &order.id, amount_in, &reason).await? {
+            return Ok(db::Order {
+                status: OrderStatus::Refunded.label().to_string(),
+                refund_reason: reason,
+                refund_address: Some(destination.to_string()),
+                ..order
+            });
+        }
+        return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
+    }
+
     if !db::claim_for_refund(&state.db, &order.id).await? {
         return Ok(db::get_order(&state.db, &order.id).await?.unwrap_or(order));
     }
 
-    let refund_address = match order.refund_address.as_deref().map(|a| a.parse::<Address<_>>()) {
-        Some(Ok(addr)) => addr.assume_checked(),
-        Some(Err(e)) => {
-            db::revert_refund_claim(&state.db, &order.id).await?;
-            anyhow::bail!("stored refund_address {:?} is invalid: {e}", order.refund_address);
-        }
-        None => {
-            db::revert_refund_claim(&state.db, &order.id).await?;
-            anyhow::bail!(
-                "order {} reached refund_requested with no refund_address on file",
-                order.id
-            );
-        }
-    };
-
-    let prepared = async {
+    let prepared = {
         let mut wallet = state.ecx.lock().await;
-        let already_spent = wallet.verify_unspent().await?;
-        let mut protected = protected_deposit_outpoints(&state.db, &wallet, Some(&order.id)).await?;
-        protected.extend(already_spent);
-        wallet.prepare_signed_transfer(
-            &refund_address,
-            Amount::from_sat(order.amount_in_sat as u64),
+        let script = order.deposit_address.parse::<Address<_>>()?.assume_checked().script_pubkey();
+        let outpoints: Vec<OutPoint> = wallet
+            .utxos()
+            .into_iter()
+            .filter(|utxo| utxo.txout.script_pubkey == script)
+            .map(|utxo| utxo.outpoint)
+            .collect();
+        wallet.prepare_return_from_deposits(
+            &destination,
+            &outpoints,
+            refund_sat,
             config::ecx_payout_fee_rate(),
-            &protected,
         )
-    }
-    .await;
-    let tx = match prepared {
-        Ok(tx) => tx,
+    };
+    let (tx, _sent) = match prepared {
+        Ok(prepared) => prepared,
         Err(e) => {
             eprintln!("refund could not be prepared for order {}: {e:#}", short(&order.id));
             db::revert_refund_claim(&state.db, &order.id).await?;
             return Ok(db::Order {
                 status: OrderStatus::RefundRequested.label().to_string(),
+                refund_address: Some(destination.to_string()),
                 ..order
             });
         }
@@ -1159,6 +1196,7 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     }
     // The hex is durable. A broadcast error leaves the order refunding so the next poll retries
     // this transaction rather than signing a different one.
+    let fee_sat = state.ecx.lock().await.change_value(&tx);
     if let Err(e) = state.ecx.lock().await.submit_signed_transfer(tx).await {
         eprintln!(
             "refund broadcast for order {} is unresolved ({refund_txid}): {e:#} - will retry the saved transaction",
@@ -1169,19 +1207,41 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
             ..order
         });
     }
-    db::update_refund(&state.db, &order.id, &refund_txid).await?;
+    db::update_refund(&state.db, &order.id, &refund_txid, fee_sat).await?;
     Ok(db::Order {
         status: OrderStatus::Refunded.label().to_string(),
         refund_txid: Some(refund_txid),
+        refund_address: Some(destination.to_string()),
         ..order
     })
 }
 
+/// Address the wrap deposit came from. Uses the stored one once a poll has recorded it, otherwise
+/// reads the deposit transaction's inputs and picks the address that paid the most.
+async fn return_address(state: &AppState, order: &db::Order) -> anyhow::Result<Address> {
+    if let Some(stored) = order.refund_address.as_deref() {
+        return Ok(stored.parse::<Address<_>>()?.assume_checked());
+    }
+    let script = order
+        .deposit_address
+        .parse::<Address<_>>()?
+        .assume_checked()
+        .script_pubkey();
+    let wallet = state.ecx.lock().await;
+    let txids: Vec<_> = wallet
+        .outputs()
+        .into_iter()
+        .filter(|output| output.txout.script_pubkey == script)
+        .map(|output| output.outpoint.txid)
+        .collect();
+    wallet.funding_address(&txids).await
+}
+
 // ---------------------------------------------------------------------------------------------
-// Peg-out (wECX -> ECX): the mirror of everything above with the two chains swapped. See
-// PLAN.md's phase 2 note and `solana::SolanaWallet::find_reference_deposit`'s doc comment for why
-// this direction can't just hand out a fresh per-order address the way the ECX side does, and
-// `db.rs`'s `pegout_orders` section for the state machine this drives.
+// Peg-out (wECX -> ECX): the mirror of everything above with the two chains swapped. Solana has
+// no fresh per-order receive address, so orders are told apart by a reference key (see
+// `solana::SolanaWallet::find_reference_deposit`). `db.rs`'s `pegout_orders` section is the state
+// machine this drives.
 // ---------------------------------------------------------------------------------------------
 
 /// Whether a landed wECX deposit is worth paying out in ECX - mirrors `payout_viable`, but there's
@@ -1210,8 +1270,7 @@ async fn check_pegout_deposit(state: &AppState, order: db::PegoutOrder, sync: bo
 /// Mirrors `detect_deposit`'s reprice-on-landed-amount behavior (see
 /// `convert::wecx_base_units_to_ecx_sat`), and its dust/below-minimum handling (see
 /// `pegout_payout_viable`) - routed to a wECX refund when `depositor_owner` could be determined,
-/// otherwise left recorded for manual review, matching the peg-in stance on a missing
-/// `refund_address`.
+/// otherwise left recorded for manual review. The customer is told the deposit was formatted wrong.
 async fn detect_pegout_deposit(state: &AppState, order: db::PegoutOrder, sync: bool) -> anyhow::Result<db::PegoutOrder> {
     let status = PegoutOrderStatus::from_label(&order.status)?;
     if !matches!(status, PegoutOrderStatus::Pending | PegoutOrderStatus::DepositSeen) || !sync {
@@ -1437,11 +1496,11 @@ async fn try_fulfill_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow:
     })
 }
 
-/// Sends a `refund_requested` peg-out order's `amount_in_base_units` back to its
-/// `depositor_owner` on Solana. No-op for orders not currently `refund_requested`, or with no
-/// `depositor_owner` on file (left for manual review). Structurally mirrors `try_fulfill`: this is
-/// a Solana send, so it needs the same two-phase sign -> persist signature -> broadcast handling
-/// and the same ambiguous-outcome deferral to `try_resolve_pegout_refund`.
+/// Sends a `refund_requested` peg-out order back to the wallet the deposit came from, minus the
+/// restocking fee. No-op with no `depositor_owner` on file (left for manual review). Structurally
+/// mirrors `try_fulfill`: this is a Solana send, so it needs the same two-phase sign -> persist
+/// signature -> broadcast handling and the same ambiguous-outcome deferral to
+/// `try_resolve_pegout_refund`.
 async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::Result<db::PegoutOrder> {
     if PegoutOrderStatus::from_label(&order.status)? != PegoutOrderStatus::RefundRequested {
         return Ok(order);
@@ -1462,6 +1521,27 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
         anyhow::bail!("stored depositor_owner {depositor_owner:?} is not payable: {e}");
     }
 
+    let amount_in = order.amount_in_base_units.max(0) as u64;
+    let (fee, refund) = convert::unmatched_refund_split(amount_in, config::unmatched_deposit_fee_bps());
+    let min_refund = convert::ecx_sat_to_wecx_base_units(
+        config::min_deposit_amount().to_sat(),
+        state.solana.decimals(),
+        0,
+    );
+    if refund == 0 || refund < min_refund {
+        eprintln!(
+            "[try_refund_pegout] order {}: refund of {refund} base units is below the minimum - keeping the deposit",
+            short(&order.id)
+        );
+        if db::finish_pegout_refund_kept(&state.db, &order.id, amount_in).await? {
+            return Ok(db::PegoutOrder {
+                status: PegoutOrderStatus::Refunded.label().to_string(),
+                ..order
+            });
+        }
+        return Ok(db::get_pegout_order(&state.db, &order.id).await?.unwrap_or(order));
+    }
+
     let sol_lamports = state.solana.sol_balance_lamports().await?;
     if sol_lamports < config::treasury_min_sol_lamports() {
         eprintln!(
@@ -1480,7 +1560,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
 
     let prepared = match state
         .solana
-        .prepare_wecx_transfer(recipient, order.amount_in_base_units as u64, 0)
+        .prepare_wecx_transfer(recipient, refund, 0)
         .await
     {
         Ok(p) => p,
@@ -1506,7 +1586,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
 
     match state.solana.submit(&prepared).await {
         Ok(solana::PayoutOutcome::Confirmed) => {
-            if !db::update_pegout_refund(&state.db, &order.id, &refund_signature).await? {
+            if !db::update_pegout_refund(&state.db, &order.id, &refund_signature, fee).await? {
                 eprintln!(
                     "[try_refund_pegout] order {}: refund {refund_signature} confirmed but the \
                      order was no longer refunding - check it manually",
@@ -1596,7 +1676,11 @@ async fn try_resolve_pegout_refund(state: &AppState, order: db::PegoutOrder) -> 
                 "[resolve_pegout_refund] order {}: refund {signature_str} did land - marking refunded",
                 short(&order.id)
             );
-            db::update_pegout_refund(&state.db, &order.id, &signature_str).await?;
+            let (fee, _) = convert::unmatched_refund_split(
+                order.amount_in_base_units.max(0) as u64,
+                config::unmatched_deposit_fee_bps(),
+            );
+            db::update_pegout_refund(&state.db, &order.id, &signature_str, fee).await?;
             Ok(db::PegoutOrder {
                 status: PegoutOrderStatus::Refunded.label().to_string(),
                 ..order
@@ -1647,85 +1731,6 @@ async fn get_order(
         check_deposit(&state, order, sync).await.unwrap_or(fallback)
     };
 
-    Ok(Json(order))
-}
-
-#[derive(Deserialize)]
-struct SetRefundAddressRequest {
-    refund_address: String,
-}
-
-/// Lets a customer who skipped `refund_address` at order creation add one later, so an order that
-/// later needs a refund isn't stuck with no destination for it. Only fills a blank: an order that
-/// already has one (from creation, or a previous call here) refuses rather than silently replacing
-/// it, and only while the order hasn't reached a terminal status.
-async fn set_refund_address(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<SetRefundAddressRequest>,
-) -> Result<Json<db::Order>, (StatusCode, String)> {
-    let Some(order) = db::get_order(&state.db, &id)
-        .await
-        .map_err(internal_error)?
-    else {
-        return Err((StatusCode::NOT_FOUND, "order not found".to_string()));
-    };
-
-    if order.refund_address.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a refund address is already set for this order".to_string(),
-        ));
-    }
-
-    let status = OrderStatus::from_label(&order.status).map_err(internal_error)?;
-    if !matches!(
-        status,
-        OrderStatus::Pending
-            | OrderStatus::DepositSeen
-            | OrderStatus::DepositConfirmed
-            | OrderStatus::PayingOut
-    ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "order is already settled (status: {}) - a refund address can no longer be set",
-                order.status
-            ),
-        ));
-    }
-
-    let ecx_network = ChainConfig::ecx().network;
-    let refund_address: Address = req
-        .refund_address
-        .trim()
-        .parse::<Address<_>>()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid refund_address: {e}")))?
-        .require_network(ecx_network)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "refund_address is not a valid {} address: {e}",
-                    config::asset_ticker()
-                ),
-            )
-        })?;
-
-    if !db::set_refund_address(&state.db, &id, &refund_address.to_string())
-        .await
-        .map_err(internal_error)?
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "a refund address was already set for this order - please refresh".to_string(),
-        ));
-    }
-
-    let order = db::get_order(&state.db, &id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "order not found".to_string()))?;
     Ok(Json(order))
 }
 
@@ -2299,10 +2304,13 @@ async fn sweep_earnings_once(state: &AppState) -> anyhow::Result<()> {
     };
     let (wecx_threshold, ecx_threshold) = settings.thresholds(state.solana.decimals())?;
     // Fees kept from reference-less deposits are unwrap-side earnings, recorded as (fee, 0).
+    let mut wrap_amounts = db::completed_wrap_amounts(&state.db).await?;
+    wrap_amounts.extend(db::wrap_restocking_fees(&state.db).await?);
     let mut unwrap_amounts = db::completed_unwrap_amounts(&state.db).await?;
     unwrap_amounts.extend(db::unmatched_deposit_fees(&state.db).await?);
+    unwrap_amounts.extend(db::pegout_restocking_fees(&state.db).await?);
     for (asset, threshold, amounts) in [
-        ("becx", ecx_threshold, db::completed_wrap_amounts(&state.db).await?),
+        ("becx", ecx_threshold, wrap_amounts),
         ("wbecx", wecx_threshold, unwrap_amounts),
     ] {
         if db::pending_earnings_sweeps(&state.db).await?.iter().any(|sweep| sweep.asset == asset) {
@@ -2591,14 +2599,17 @@ async fn revive_late_pegouts(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serves `GET /quote`, `POST /orders`, `GET /orders/{id}`, and `POST /orders/{id}/refund-address`
-/// on `addr`, and spawns the background order poller (see `run_order_poller`).
+/// Serves the quote and order API on `addr`, and spawns the background order poller (see
+/// `run_order_poller`).
 pub async fn serve(
     ecx: ChainWallet,
     solana: SolanaWallet,
     db: db::Connection,
     addr: &str,
 ) -> anyhow::Result<()> {
+    if config::live_payouts_allowed() {
+        config::reject_public_solana_rpc(&config::solana_rpc_url())?;
+    }
     let earnings = config::EarningsConfig::load()?;
     if let Some(settings) = earnings.as_ref().filter(|settings| settings.enabled) {
         anyhow::ensure!(solana.decimals() == 8, "earnings sweeps currently require an 8-decimal wbECX mint");
@@ -2633,7 +2644,6 @@ pub async fn serve(
         .route("/stats", get(get_stats))
         .route("/orders", post(create_order))
         .route("/orders/{id}", get(get_order))
-        .route("/orders/{id}/refund-address", post(set_refund_address))
         .route("/pegout/quote", get(get_pegout_quote))
         .route("/pegout/orders", post(create_pegout_order))
         .route("/pegout/orders/{id}", get(get_pegout_order))

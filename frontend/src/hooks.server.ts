@@ -72,7 +72,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (!edgeAuthorized(event.request)) {
 		return new Response('not found', { status: 404 });
 	}
-	if (event.request.method === 'POST' && /\/(bridge\/orders|pegout\/orders|refund-address)$/.test(event.url.pathname)) {
+	if (event.request.method === 'POST' && /\/(bridge\/orders|pegout\/orders)$/.test(event.url.pathname)) {
 		if (!allowOrderPost(clientIp(event.request))) {
 			return new Response('too many orders from this address - please retry shortly', { status: 429 });
 		}

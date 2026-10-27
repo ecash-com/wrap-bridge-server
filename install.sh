@@ -21,12 +21,13 @@ EXAMPLE_FILE="$ROOT/params.conf.example"
 BUNDLE="$ROOT/bundle"
 ASSIST="$OPT/assistant"
 # Keys whose value in params.conf.example only shows the shape of a real one. A filled file that
-# still carries that sample is refused. Keys with working defaults (mint, fees, URLs) are not listed.
+# still carries that sample is refused. Keys with working defaults (mint, fees, the ECX explorer
+# URL) are not listed. SOLANA_RPC_URL is listed: the sample is not a working endpoint.
 MUST_REPLACE_KEYS=(
 	WALLET_MNEMONIC WALLET_PASSPHRASE SOLANA_KEYPAIR OWNER_ECX_ADDRESS OWNER_SOL_ADDRESS
 	VPN_WG_PRIVATE_KEY VPN_WG_ADDRESS VPN_WG_DNS VPN_WG_PEER_PUBLIC_KEY VPN_WG_ENDPOINT VPN_PUBLIC_IPV4
 	HOP1_WG_PRIVATE_KEY HOP1_WG_ADDRESS HOP1_WG_DNS HOP1_WG_PEER_PUBLIC_KEY HOP1_WG_ENDPOINT
-	CLOUDFLARE_TUNNEL_TOKEN CLOUDFLARE_HOSTNAME
+	CLOUDFLARE_TUNNEL_TOKEN CLOUDFLARE_HOSTNAME SOLANA_RPC_URL
 )
 declare -A PARAM_VALUES=() EXAMPLE_VALUES=()
 NEW_BRIDGE_HINT="Restore the previous value, or, to run a different bridge on this machine, settle every order and move the funds out first, then move $OPT/backend/data and /var/lib/ecash-bridge/deposit-addresses.txt aside."
@@ -244,7 +245,13 @@ validate_params() {
 	fi
 
 	[[ "${ECX_ESPLORA_URL:-https://explorer.beta.ecash.ninja/api/}" == https://* ]] || die "ECX_ESPLORA_URL must start with https://"
-	[[ "${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}" == https://* ]] || die "SOLANA_RPC_URL must start with https://"
+	need SOLANA_RPC_URL "${SOLANA_RPC_URL:-}"
+	[[ "$SOLANA_RPC_URL" == https://* ]] || die "SOLANA_RPC_URL must be an https URL. See deploy/edge/solana-rpc.md"
+	case "$SOLANA_RPC_URL" in
+		*api.mainnet-beta.solana.com*|*api.devnet.solana.com*|*api.testnet.solana.com*)
+			die "SOLANA_RPC_URL is a public Solana endpoint. Buy a paid RPC. See deploy/edge/solana-rpc.md" ;;
+	esac
+	[[ "$SOLANA_RPC_URL" != *replace-this-paid-key* ]] || die "SOLANA_RPC_URL is still the sample from params.conf.example. See deploy/edge/solana-rpc.md"
 	[[ -z "${ECX_EXPLORER_TX_URL:-}" || "${ECX_EXPLORER_TX_URL}" == https://* ]] || die "ECX_EXPLORER_TX_URL must be empty or start with https://"
 	[[ -z "${SOLANA_EXPLORER_TX_URL:-}" || "${SOLANA_EXPLORER_TX_URL}" == https://* ]] || die "SOLANA_EXPLORER_TX_URL must be empty or start with https://"
 	[[ "${PEGIN_FEE_BPS:-100}" =~ ^[0-9]+$ ]] || die "PEGIN_FEE_BPS must be an integer"
@@ -331,7 +338,7 @@ SOLANA_KEYPAIR="$SOLANA_KEYPAIR"
 WECX_MINT_ADDRESS="$WECX_MINT_ADDRESS"
 ASSET_TICKER="${ASSET_TICKER:-bECX}"
 ECX_ESPLORA_URL="${ECX_ESPLORA_URL:-https://explorer.beta.ecash.ninja/api/}"
-SOLANA_RPC_URL="${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}"
+SOLANA_RPC_URL="$SOLANA_RPC_URL"
 SOLANA_EXPLORER_TX_URL="${SOLANA_EXPLORER_TX_URL:-https://solscan.io/tx}"
 PEGIN_FEE_BPS="${PEGIN_FEE_BPS:-100}"
 PEGOUT_FEE_BPS="${PEGOUT_FEE_BPS:-100}"

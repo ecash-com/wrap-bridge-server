@@ -71,7 +71,7 @@ enum Command {
         all: bool,
         #[arg(long, default_value_t = 2)]
         fee_rate: u64,
-        /// Required to actually broadcast: betanet ECX is real money (see CLAUDE.md), not a test
+        /// Required to actually broadcast: betanet ECX is real money, not a test
         /// network.
         #[arg(long)]
         confirm_live: bool,
@@ -115,7 +115,7 @@ enum Command {
         /// --amount-base-units.
         #[arg(long)]
         all: bool,
-        /// Required to actually broadcast: Solana mainnet-beta is real money (see CLAUDE.md).
+        /// Required to actually broadcast: Solana mainnet-beta is real money.
         #[arg(long)]
         confirm_live: bool,
     },
@@ -129,7 +129,7 @@ enum Command {
         /// Amount in lamports. Exclusive with --amount-sol.
         #[arg(long, conflicts_with = "amount_sol")]
         amount_lamports: Option<u64>,
-        /// Required to actually broadcast: Solana mainnet-beta is real money (see CLAUDE.md).
+        /// Required to actually broadcast: Solana mainnet-beta is real money.
         #[arg(long)]
         confirm_live: bool,
     },
@@ -165,14 +165,14 @@ async fn open_solana_wallet() -> Result<SolanaWallet> {
     SolanaWallet::open(&rpc_url, &keypair, mint).await
 }
 
-/// Both betanet ECX and Solana mainnet-beta are real money (see CLAUDE.md) - there's no test
+/// Both betanet ECX and Solana mainnet-beta are real money. There's no test
 /// network for either side of this bridge, so every manual CLI send needs an explicit opt-in
 /// rather than defaulting to "just broadcast it".
 fn require_live_confirmation(confirmed: bool, description: &str) -> Result<()> {
     if !confirmed {
         bail!(
             "refusing to broadcast {description} without --confirm-live: both betanet ECX and \
-             Solana mainnet-beta are real money (see CLAUDE.md). Re-run with --confirm-live once \
+             Solana mainnet-beta are real money. Re-run with --confirm-live once \
              you're sure."
         );
     }

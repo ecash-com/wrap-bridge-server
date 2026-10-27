@@ -9,7 +9,8 @@
 #
 # Format: KEY = "value", one per line, double quotes required. A value may not contain a double
 # quote, a single quote, a backslash, a dollar sign, or a backtick.
-# How to obtain each value: docs/prepare.md, deploy/edge/purchase.md, deploy/edge/cloudflare.md.
+# How to obtain each value: docs/prepare.md, deploy/edge/purchase.md,
+# deploy/edge/solana-rpc.md, deploy/edge/cloudflare.md.
 # Do not put an account password, a Mullvad account number, or a card number here.
 
 # --- Hot wallets. Generate new ones. Do not reuse a wallet that holds other funds. ---
@@ -88,7 +89,7 @@ UNMATCHED_DEPOSIT_FEE_BPS = "100"
 ORDER_LIFETIME_MINUTES = "15"
 # Open orders allowed per direction. Each open order costs the server one explorer lookup every
 # five minutes, so this bounds the load from a flood of unpaid orders. 500 suits the public
-# explorer and Solana endpoints; raise it when you run your own.
+# ECX explorer and a paid Solana RPC; raise it when you run your own explorer.
 MAX_PENDING_ORDERS = "500"
 
 # Optional wrap checkbox: extra ECX buys a little SOL so a new wallet can move the wrapped token.
@@ -100,9 +101,13 @@ SOL_STIPEND_LAMPORTS = "5000000"
 SOL_STIPEND_PRICE_SAT = "500000"
 SOL_STIPEND_USD_LABEL = "0.50"
 
-# --- Chain endpoints. Leave these unless you run your own. Both must start with https:// ---
+# --- Chain endpoints. Both must start with https:// ---
+# The ECX explorer default is a working public endpoint. Leave it unless you run your own.
 ECX_ESPLORA_URL = "https://explorer.beta.ecash.ninja/api/"
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+# Replace. The HTTPS URL of a paid Solana mainnet RPC, including the API key. See
+# deploy/edge/solana-rpc.md. Not the public endpoint https://api.mainnet-beta.solana.com — the
+# installer refuses that host. The URL is a secret: it contains the key.
+SOLANA_RPC_URL = "https://mainnet.helius-rpc.com/?api-key=replace-this-paid-key"
 # Where the order page's "View on explorer" links point; the transaction id is appended. Leave
 # empty to derive the first from ECX_ESPLORA_URL and use Solscan for the second.
 ECX_EXPLORER_TX_URL = ""

@@ -39,10 +39,7 @@
 	// presentAmount/parseDisplayAmount; wECX has no such toggle and binds directly).
 	let amountIn = $state('');
 	let recipientAddress = $state('');
-	// Where the ECX deposit gets sent back if it can't be bridged (see /orders/[id]) - only
-	// meaningful for pegin; peg-out has no equivalent field, since its refund destination is
-	// recovered automatically from the deposit transaction itself.
-	let refundAddress = $state('');
+	let ecxExplorerSite = $state('https://explorer.beta.ecash.ninja');
 
 	let hasStoredOrders = $state(false);
 	$effect(() => {
@@ -79,6 +76,9 @@
 				solStipendLamports = data.solStipendLamports ?? 0;
 				solStipendPriceSat = data.solStipendPriceSat ?? 0;
 				solStipendUsdLabel = data.solStipendUsdLabel ?? '';
+				if (typeof data.ecxExplorerTxUrl === 'string' && data.ecxExplorerTxUrl) {
+					ecxExplorerSite = data.ecxExplorerTxUrl.replace(/\/tx\/?$/, '');
+				}
 			});
 		return () => {
 			cancelled = true;
@@ -152,9 +152,9 @@
 	}
 
 	// Swaps which direction is active. The last computed *output* becomes the new input estimate
-	// (mirrors the old swap's flip()), but the recipient/refund addresses are always cleared rather
-	// than carried across - they're addresses on two different chains, and reusing one after a flip
-	// would silently point real money at the wrong chain's address format.
+	// (mirrors the old swap's flip()), but the recipient address is always cleared rather than
+	// carried across - the two directions use addresses on different chains, and reusing one after
+	// a flip would silently point real money at the wrong chain's address format.
 	function flip() {
 		const nextAmountIn =
 			direction === 'pegin'
@@ -169,7 +169,6 @@
 		amountOutBaseUnits = null;
 		amountOutSat = null;
 		recipientAddress = '';
-		refundAddress = '';
 		submitError = '';
 		clearTimeout(debounceTimer);
 		quoting = false;
@@ -235,7 +234,6 @@
 					body: JSON.stringify({
 						amountInSat: Math.round(parseFloat(amountIn) * 1e8),
 						solanaRecipient: recipientAddress,
-						refundAddress,
 						includeSolStipend: solOfferVisible && includeSol
 					})
 				});
@@ -348,9 +346,10 @@
 					next page. A plain transfer to the treasury address carries no order reference and cannot be
 					matched to your order:
 					{#if unmatchedDepositRefunds && unmatchedDepositFeeFraction != null}
-						it is sent back to the wallet it came from, minus a
-						<span class="font-semibold">{formatPercent(unmatchedDepositFeeFraction)} fee</span>, once it
-						finalizes. Never send from an exchange: a refund to an exchange's wallet is lost.
+						that deposit is formatted wrong. It is sent back to the wallet it came from, minus a
+						<span class="font-semibold"
+							>{formatPercent(unmatchedDepositFeeFraction)} restocking fee</span
+						>, once it finalizes. Never send from an exchange: a refund to an exchange's wallet is lost.
 					{:else}
 						it is held for the operator to sort out by hand.
 					{/if}
@@ -412,7 +411,7 @@
 								>
 							</span>
 							<a
-								href="https://explorer.ecash.com"
+								href={ecxExplorerSite}
 								target="_blank"
 								rel="noopener noreferrer"
 								class="text-[10px] text-zinc-500 underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-white"
@@ -546,7 +545,7 @@
 								>
 							</span>
 							<a
-								href="https://explorer.ecash.com"
+								href={ecxExplorerSite}
 								target="_blank"
 								rel="noopener noreferrer"
 								class="text-[10px] text-zinc-500 underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-white"
@@ -645,27 +644,13 @@
 			</p>
 		{/if}
 
-		<!-- Refund address is wrap-only. Unwrap recovers its refund destination from the deposit. -->
-		{#if direction === 'pegin'}
-			<div
-				class="mt-3 rounded-xl bg-white p-4 ring-1 ring-black/5 dark:bg-zinc-900 dark:ring-white/5"
-			>
-				<label for="refund-address" class="mb-2 block text-xs font-medium text-zinc-500">
-					Refund {ecxTicker()} (betanet) to (optional)
-				</label>
-				<input
-					id="refund-address"
-					type="text"
-					bind:value={refundAddress}
-					placeholder="ecash:…"
-					class="w-full bg-transparent font-mono text-sm text-zinc-900 outline-none placeholder:text-zinc-500 dark:text-white dark:placeholder:text-zinc-600"
-				/>
-				<p class="mt-2 text-xs text-zinc-600">
-					Used only if your deposit can't be bridged (e.g. it's too small after fees). Without one,
-					a deposit that can't be bridged just sits for manual review.
-				</p>
-			</div>
-		{/if}
+		<p class="mt-3 px-1 text-xs text-zinc-600">
+			A deposit that is formatted wrong is sent back to the address it came from, minus a
+			{unmatchedDepositFeeFraction != null
+				? formatPercent(unmatchedDepositFeeFraction)
+				: '1%'}
+			restocking fee, once it confirms. Do not send from an exchange: that refund is lost.
+		</p>
 
 		{#if submitError}
 			<p class="mt-3 text-center text-xs font-medium text-red-600 dark:text-red-400">
