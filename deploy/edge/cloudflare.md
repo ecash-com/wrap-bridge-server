@@ -8,7 +8,7 @@ Use a new domain. `swap.beta.ecash.com` already published `172.237.148.99`. Addi
 
 ## 1. Account and domain
 
-1. Create an account at https://dash.cloudflare.com/sign-up. Use an email that is not the OVPN account email.
+1. Create an account at https://dash.cloudflare.com/sign-up. Use an email that is not the exit VPN's account email.
 2. In the dashboard, go to **Domains** and select **Onboard a domain**. Enter the apex domain, such as `example.com`, not a hostname under it. Cloudflare's own onboarding page is https://developers.cloudflare.com/fundamentals/manage-domains/add-site/.
 3. Select the Free plan. On https://www.cloudflare.com/plans/network-cdn.md that plan is $0 and includes DNS, the CDN, a universal certificate, unmetered DDoS protection, and the basic WAF. Pro is $20 per month billed annually, or $25 billed monthly. Buy Pro only if you want ticket support. The tunnel does not require it.
 4. On the DNS review screen, delete every A and AAAA record. A scanned record can point at an old host. Do not add the house address. Do not add `VPN_PUBLIC_IPV4`.
@@ -57,7 +57,18 @@ A CAA record is optional and is not an address. If you add one, allow only the i
 
 Do not put a Cloudflare Access policy in front of this hostname. Access would demand a Cloudflare login from every customer. This site is public.
 
-## 4. What the installer accepts
+## 4. Rate limiting
+
+The bridge takes orders without a login, so the only thing that separates one customer from a flood is the address Cloudflare saw. The frontend allows eight order requests per minute per address, and the backend refuses everything above about two orders per second in total. Both run after the request has crossed the tunnel. Cloudflare can refuse earlier, before the tunnel, and the Free plan includes one rate limiting rule. Use it.
+
+1. In the zone, go to **Security** > **WAF** > **Rate limiting rules**, then **Create rule**.
+2. Match requests whose method is `POST` and whose URI path ends with `/orders` or `/refund-address`. Those are the only requests that create work for the bridge.
+3. Count by IP. Set the rate to the lowest the plan offers, such as 10 requests in 10 seconds, and the action to **Block**.
+4. Leave `GET` requests alone. Customers poll their order page, and the backend already spaces out the chain lookups those polls can trigger.
+
+If a flood gets past that rule, the zone's **Under Attack Mode** puts a browser check in front of every page. It stops bots and annoys customers. Turn it off afterwards.
+
+## 5. What the installer accepts
 
 | Installer token | Where it comes from |
 | --- | --- |
