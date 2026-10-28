@@ -7,6 +7,7 @@ interface StatsResponse {
 	ecx_unconfirmed_sat: string;
 	wecx_balance_base_units: string;
 	sol_balance_lamports: string;
+	ecx_treasury_address: string;
 	solana_treasury_address: string;
 	wecx_decimals: number;
 	wraps: number;

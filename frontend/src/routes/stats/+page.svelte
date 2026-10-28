@@ -145,7 +145,15 @@
 						</tr>
 						<tr>
 							<th scope="row" class="px-3 py-2.5 font-medium text-zinc-800 dark:text-zinc-200"
-								>Account</th
+								>{assetTicker()} Address</th
+							>
+							<td colspan="2" class="px-3 py-2.5 break-all text-zinc-700 dark:text-zinc-300">
+								{data.stats.ecx_treasury_address}
+							</td>
+						</tr>
+						<tr>
+							<th scope="row" class="px-3 py-2.5 font-medium text-zinc-800 dark:text-zinc-200"
+								>Solana Account</th
 							>
 							<td colspan="2" class="px-3 py-2.5 break-all text-zinc-700 dark:text-zinc-300">
 								{data.stats.solana_treasury_address}

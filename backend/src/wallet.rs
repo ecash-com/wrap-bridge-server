@@ -124,13 +124,19 @@ impl ChainWallet {
             .load_wallet(&mut store)
             .context("failed to load wallet from store")?;
 
-        let inner = match loaded {
+        let mut inner = match loaded {
             Some(w) => w,
             None => Wallet::create(external_desc, internal_desc)
                 .network(config.network)
                 .create_wallet(&mut store)
                 .context("failed to create wallet")?,
         };
+        // Reserve external index 0 as the persistent treasury deposit address before any customer
+        // order can call `fresh_address()`.
+        if inner.derivation_index(KeychainKind::External).is_none() {
+            inner.reveal_next_address(KeychainKind::External);
+            inner.persist(&mut store)?;
+        }
 
         let client = match config.backend {
             Backend::Esplora => Client::Esplora {
@@ -222,6 +228,13 @@ impl ChainWallet {
             original_error: dump_err.error.to_string(),
             balance: loaded_wallet.balance(),
         })
+    }
+
+    /// The wallet's primary external receive address (index 0), used as the public ECX treasury
+    /// address for operator top-ups. Customer wrap orders always allocate via `fresh_address()`,
+    /// which advances to index 1+, so index 0 is never assigned to an order.
+    pub fn treasury_address(&self) -> Address {
+        self.inner.peek_address(KeychainKind::External, 0).address
     }
 
     pub fn next_address(&mut self) -> Result<Address> {
@@ -970,7 +983,12 @@ mod ownership_tests {
         )
         .unwrap();
 
+        let treasury = wallet.treasury_address();
+        let next = wallet.next_address().unwrap();
+        assert_eq!(treasury, next, "initial unused address is the treasury address (index 0)");
         let revealed = wallet.fresh_address().unwrap();
+        assert_ne!(treasury, revealed, "customer order addresses (fresh_address) must never reuse the treasury address");
+        assert!(wallet.owns_address(&treasury), "the treasury address is ours");
         assert!(wallet.owns_address(&revealed), "a revealed deposit address is ours");
 
         let deep_change = wallet.inner.peek_address(KeychainKind::Internal, 999).address;

@@ -162,6 +162,7 @@ struct StatsResponse {
     ecx_unconfirmed_sat: String,
     wecx_balance_base_units: String,
     sol_balance_lamports: String,
+    ecx_treasury_address: String,
     solana_treasury_address: String,
     wecx_decimals: u8,
     wraps: u64,
@@ -242,6 +243,10 @@ async fn get_stats(
         .sum();
 
     let mut ecx = state.ecx.lock().await;
+    let ecx_treasury_address = ecx.treasury_address();
+    if let Err(e) = ecx.sync_addresses([ecx_treasury_address.script_pubkey()]).await {
+        eprintln_redacted!("[stats] ecx treasury address sync failed: {e:#}");
+    }
     ecx.verify_unspent().await.map_err(internal_error)?;
     let balance = ecx.balance();
     let ecx_unconfirmed = balance.trusted_pending + balance.untrusted_pending;
@@ -265,6 +270,7 @@ async fn get_stats(
         ecx_unconfirmed_sat: ecx_unconfirmed_sat.to_string(),
         wecx_balance_base_units: wecx_balance_base_units.to_string(),
         sol_balance_lamports: sol_balance_lamports.to_string(),
+        ecx_treasury_address: ecx_treasury_address.to_string(),
         solana_treasury_address: state.solana.pubkey().to_string(),
         wecx_decimals: decimals,
         wraps: wraps.len() as u64,
@@ -2461,10 +2467,11 @@ async fn poll_orders_once(state: &AppState) -> anyhow::Result<()> {
     let active = db::list_active_orders(&state.db).await?;
     eprintln!("[poll] tick: {} active order(s)", active.len());
 
-    // Batch-sync once per tick, scoped to the deposit addresses of orders `detect_deposit` will
-    // actually check (`pending`/`deposit_seen`) rather than a full `ChainWallet::sync`, which
-    // re-checks every script pubkey the wallet has ever revealed - see `ChainWallet::sync_addresses`.
-    let mut scripts = Vec::new();
+    // Batch-sync once per tick, scoped to the treasury deposit address and the deposit addresses
+    // of orders `detect_deposit` will actually check (`pending`/`deposit_seen`) rather than a full
+    // `ChainWallet::sync`, which re-checks every script pubkey the wallet has ever revealed - see
+    // `ChainWallet::sync_addresses`.
+    let mut scripts = vec![state.ecx.lock().await.treasury_address().script_pubkey()];
     for o in &active {
         if !matches!(
             OrderStatus::from_label(&o.status)?,
