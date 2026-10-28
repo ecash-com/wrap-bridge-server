@@ -1,8 +1,27 @@
-# ECX bridge
+## ECX bridge
 
-Custodial bridge for one asset at a time. The default display name is `bECX`, and the wrapped name is always `w` plus that name (`wbECX`). Set `ASSET_TICKER` to `ECX` or `aECX` if that is the name you want shown. This repository does not create the mint and it does not create the AMM pool. The published mint is `EVHqNdzjCupKi4rQkbuYw52sa1m8A7jeUAMP23S9AVVq`. Put a different mint in `params.conf` if you run one.
+This is a custodial bridge for converting **ECX** into **wrapped ECX** (aka wECX) -- and vice versa.
 
-Install on a new Ubuntu Server only after the tokens and wallets exist. The order is [docs/prepare.md](docs/prepare.md), then [params.conf.example](params.conf.example), then [docs/install.md](docs/install.md).
+It is designed to be (relatively) easy to start up, and operate:
+
+1. Sign up for [Cloudflare](https://www.cloudflare.com/), [SurfShark](https://surfshark.com/), [Mullvad](https://mullvad.net/en), and [Helius](https://www.helius.dev/).
+2. Create new wallets (keep the private keys safe and private!):
+   - 1 hot ECX wallet
+   - 1 cold storage ECX wallet
+   - 1 hot solana wallet
+   - 1 cold storage solana wallet
+3. Get a server somewhere, with the [Ubuntu Server](https://ubuntu.com/download/server) operating system.
+4. Copy everything in this repo to that server.
+5. Edit **params.conf** to replace all the example values with your own values (see below). Be sure to replace "bECX" with "ECX", for example, if you are using real ECX.
+6. Run the **install.sh** below.
+
+It should just work! And it should be: secure, safe, ddos-resistant, and user-friendly for swapping. It even comes with a tiny LLM (optional), so that you have someone to talk to.
+
+Install on a new Ubuntu Server only after the tokens and wallets exist.
+
+The order is: [docs/prepare.md](docs/prepare.md), then [params.conf.example](params.conf.example), then [docs/install.md](docs/install.md).
+
+### Install
 
 ```sh
 cp params.conf.example "$HOME/bridge-params.conf"
@@ -15,7 +34,7 @@ The installer downloads nothing: the server can be installed with the cable unpl
 
 The service takes ECX and pays wECX, or takes wECX and pays ECX. It holds both treasuries. It does not have mint authority. On a wrap, the customer can pay a fixed extra amount of the native asset to receive a small SOL stipend in the same transaction. If the recipient has no token account, the order also adds that account's rent in native coin, 1:1, and only then. A wallet with no SOL can still receive the wrapped token.
 
-## Parts
+### Parts
 
 - **[backend](backend/)** — the Rust/axum service: HTTP API plus CLI, holds both the ECX (BDK)
   wallet and the Solana treasury, and runs the poller that matches deposits to orders and sends
@@ -25,3 +44,7 @@ The service takes ECX and pays wECX, or takes wECX and pays ECX. It holds both t
 
 Run the backend first — the frontend needs a live `BACKEND_URL` to talk to. Each has its own
 `.env.example` and setup instructions in its README.
+
+### Feedback
+
+If you have ideas for improving this project, please let us know!
