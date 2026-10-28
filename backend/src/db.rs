@@ -212,6 +212,14 @@ impl Rows {
 }
 
 impl Connection {
+    #[cfg(test)]
+    pub(crate) async fn in_memory_for_test() -> Self {
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = Connection(Arc::new(Mutex::new(sqlite)));
+        conn.execute_batch(SCHEMA).await.unwrap();
+        conn
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
         self.0
             .lock()
@@ -861,6 +869,12 @@ pub async fn outbound_tx_hex(conn: &Connection, order_id: &str, kind: &str) -> R
 /// `amount_out_base_units` is corrected in the same write, always paired with `amount_in_sat` so a
 /// wrong-amount deposit's `status` transition and its repriced payout land atomically.
 ///
+/// `sol_stipend_lamports` and `sol_stipend_price_sat` are updated too: while `deposit_seen` they
+/// keep the offer locked at creation, and once `deposit_confirmed` they record what the deposit
+/// actually covered (0 when a short deposit dropped the stipend - see
+/// `convert::settle_wrap_deposit`), so `completed_wrap_amounts`, `reserved_customer_sol_lamports`,
+/// and `GET /orders/{id}` reflect the settled stipend rather than an unpaid quote.
+///
 /// Conditional on the order still being `pending`/`deposit_seen`. `server::detect_deposit` decides
 /// what to write from an in-memory snapshot that can be arbitrarily stale (a concurrent
 /// `GET /orders/{id}`, or the poller working through a batch, may have already advanced the order);
@@ -875,18 +889,23 @@ pub async fn update_deposit(
     deposit_txid: &str,
     amount_in_sat: Amount,
     amount_out_base_units: u64,
+    sol_stipend_lamports: u64,
+    sol_stipend_price_sat: u64,
     confirmations: u32,
 ) -> Result<bool> {
     let rows_affected = conn
         .execute(
             "UPDATE bridge_orders SET status = ?, deposit_txid = ?, amount_in_sat = ?, \
-             amount_out_base_units = ?, deposit_confirmations = ?, updated_at = unixepoch() \
+             amount_out_base_units = ?, sol_stipend_lamports = ?, sol_stipend_price_sat = ?, \
+             deposit_confirmations = ?, updated_at = unixepoch() \
              WHERE id = ? AND status IN (?, ?)",
             (
                 status.label(),
                 deposit_txid,
                 to_i64(amount_in_sat.to_sat())?,
                 to_i64(amount_out_base_units)?,
+                to_i64(sol_stipend_lamports)?,
+                to_i64(sol_stipend_price_sat)?,
                 i64::from(confirmations),
                 id,
                 OrderStatus::Pending.label(),
@@ -2082,5 +2101,341 @@ mod recent_order_tests {
         assert_eq!(customer_earnings_reserve(&conn, "becx").await.unwrap(), 497);
         assert_eq!(customer_earnings_reserve(&conn, "wbecx").await.unwrap(), 498);
         assert_eq!(unsettled_deposit_addresses(&conn).await.unwrap(), vec!["deposit-2"]);
+    }
+
+    #[tokio::test]
+    async fn wrap_order_state_machine_enforces_claims_reserves_and_expiry_guards() {
+        let conn = Connection::in_memory_for_test().await;
+
+        let created = insert_order(
+            &conn,
+            &NewOrder {
+                amount_in_sat: 100_703_928,
+                amount_out_base_units: 98_999_010,
+                deposit_address: "bc1qdep1".to_string(),
+                solana_recipient: "sol-recip-1".to_string(),
+                sol_stipend_lamports: 5_000_000,
+                sol_stipend_price_sat: 500_000,
+                ata_rent_lamports: 2_039_280,
+                ata_rent_price_sat: 203_928,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status, "pending");
+        assert_eq!(count_pending_orders(&conn).await.unwrap(), 1);
+        // Pending orders reserve customer SOL (stipend + ATA rent) but not wECX until a deposit is seen.
+        assert_eq!(reserved_customer_sol_lamports(&conn).await.unwrap(), 7_039_280);
+        assert_eq!(reserved_wecx_amount(&conn).await.unwrap(), 0);
+
+        // Duplicate deposit_address must be rejected by the unique index.
+        assert!(
+            insert_order(
+                &conn,
+                &NewOrder {
+                    amount_in_sat: 10_000,
+                    amount_out_base_units: 9_000,
+                    deposit_address: "bc1qdep1".to_string(),
+                    solana_recipient: "sol-recip-2".to_string(),
+                    sol_stipend_lamports: 0,
+                    sol_stipend_price_sat: 0,
+                    ata_rent_lamports: 0,
+                    ata_rent_price_sat: 0,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        // Expire and revive while pending.
+        assert!(expire_order(&conn, &created.id).await.unwrap());
+        assert!(!expire_order(&conn, &created.id).await.unwrap());
+        assert_eq!(reserved_customer_sol_lamports(&conn).await.unwrap(), 0);
+        assert_eq!(list_expired_orders_since(&conn, 0, 10).await.unwrap().len(), 1);
+        assert!(revive_expired_order(&conn, &created.id).await.unwrap());
+        assert!(!revive_expired_order(&conn, &created.id).await.unwrap());
+
+        // Deposit seen -> reserves wECX and blocks expiry.
+        assert!(
+            update_deposit(
+                &conn,
+                &created.id,
+                OrderStatus::DepositSeen,
+                "tx-dep-1",
+                Amount::from_sat(100_703_928),
+                98_999_010,
+                5_000_000,
+                500_000,
+                1,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(!expire_order(&conn, &created.id).await.unwrap(), "a seen deposit must never expire");
+        assert_eq!(reserved_wecx_amount(&conn).await.unwrap(), 98_999_010);
+
+        // Confirm deposit, claim for payout (only one caller wins), record signature, revert, then pay out.
+        assert!(
+            update_deposit(
+                &conn,
+                &created.id,
+                OrderStatus::DepositConfirmed,
+                "tx-dep-1",
+                Amount::from_sat(100_703_928),
+                98_999_010,
+                5_000_000,
+                500_000,
+                3,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(claim_for_payout(&conn, &created.id).await.unwrap());
+        assert!(!claim_for_payout(&conn, &created.id).await.unwrap(), "concurrent claim must lose");
+        assert!(
+            !update_deposit(
+                &conn,
+                &created.id,
+                OrderStatus::DepositConfirmed,
+                "tx-dep-1",
+                Amount::from_sat(100_703_928),
+                98_999_010,
+                5_000_000,
+                500_000,
+                3,
+            )
+            .await
+            .unwrap(),
+            "stale detect_deposit snapshot must not drag paying_out back to deposit_confirmed"
+        );
+        assert!(record_payout_signature(&conn, &created.id, "sol-sig-1").await.unwrap());
+        revert_claim(&conn, &created.id).await.unwrap();
+        let after_revert = get_order(&conn, &created.id).await.unwrap().unwrap();
+        assert_eq!(after_revert.status, "deposit_confirmed");
+        assert_eq!(after_revert.payout_signature, None);
+
+        assert!(claim_for_payout(&conn, &created.id).await.unwrap());
+        assert!(update_payout(&conn, &created.id, "sol-sig-final").await.unwrap());
+        assert_eq!(reserved_wecx_amount(&conn).await.unwrap(), 0);
+        assert_eq!(reserved_customer_sol_lamports(&conn).await.unwrap(), 0);
+        assert_eq!(
+            completed_wrap_amounts(&conn).await.unwrap(),
+            vec![(100_000_000, 98_999_010)],
+            "stipend and ATA rent prices must be excluded from completed wrap amounts"
+        );
+
+        // Refund flow on a second wrap order: set_refund_address is write-once, outbound_txs persists hex.
+        let refund_order = insert_order(
+            &conn,
+            &NewOrder {
+                amount_in_sat: 10_000,
+                amount_out_base_units: 0,
+                deposit_address: "bc1qdep2".to_string(),
+                solana_recipient: "sol-recip-2".to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        update_deposit(
+            &conn,
+            &refund_order.id,
+            OrderStatus::DepositConfirmed,
+            "tx-dep-2",
+            Amount::from_sat(10_000),
+            0,
+            0,
+            0,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(request_refund(&conn, &refund_order.id, "formatted wrong").await.unwrap());
+        assert!(set_refund_address(&conn, &refund_order.id, "bc1qreturn1").await.unwrap());
+        assert!(
+            !set_refund_address(&conn, &refund_order.id, "bc1qreturn2").await.unwrap(),
+            "existing refund address must not be overwritten"
+        );
+        assert!(claim_for_refund(&conn, &refund_order.id).await.unwrap());
+        assert!(!claim_for_refund(&conn, &refund_order.id).await.unwrap());
+        revert_refund_claim(&conn, &refund_order.id).await.unwrap();
+        assert!(claim_for_refund(&conn, &refund_order.id).await.unwrap());
+        record_outbound_tx(&conn, &refund_order.id, "wrap_refund", "tx-ref-2", "deadbeef")
+            .await
+            .unwrap();
+        assert_eq!(
+            outbound_tx_hex(&conn, &refund_order.id, "wrap_refund").await.unwrap().as_deref(),
+            Some("deadbeef")
+        );
+        update_refund(&conn, &refund_order.id, "tx-ref-2", 100).await.unwrap();
+        assert_eq!(wrap_restocking_fees(&conn).await.unwrap(), vec![(100, 0)]);
+
+        // Dust wrap refund kept whole as fee.
+        let kept_order = insert_order(
+            &conn,
+            &NewOrder {
+                amount_in_sat: 400,
+                amount_out_base_units: 0,
+                deposit_address: "bc1qdep3".to_string(),
+                solana_recipient: "sol-recip-3".to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        update_deposit(
+            &conn,
+            &kept_order.id,
+            OrderStatus::DepositConfirmed,
+            "tx-dep-3",
+            Amount::from_sat(400),
+            0,
+            0,
+            0,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(request_refund(&conn, &kept_order.id, "initial").await.unwrap());
+        assert!(finish_refund_kept(&conn, &kept_order.id, 400, "kept").await.unwrap());
+        let mut fees = wrap_restocking_fees(&conn).await.unwrap();
+        fees.sort();
+        assert_eq!(fees, vec![(100, 0), (400, 0)]);
+        assert!(list_active_orders(&conn).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pegout_order_state_machine_enforces_claims_reserves_and_refunds() {
+        let conn = Connection::in_memory_for_test().await;
+
+        let created = insert_pegout_order(
+            &conn,
+            &NewPegoutOrder {
+                amount_in_base_units: 100_000,
+                amount_out_sat: 99_000,
+                ecx_recipient: "bc1qecx1".to_string(),
+                reference_pubkey: "ref-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_pending_pegout_orders(&conn).await.unwrap(), 1);
+        assert_eq!(pegout_reserved_ecx_amount(&conn).await.unwrap(), 0);
+        assert!(pegout_reference_pubkeys(&conn).await.unwrap().contains("ref-1"));
+
+        // Duplicate reference_pubkey must be rejected.
+        assert!(
+            insert_pegout_order(
+                &conn,
+                &NewPegoutOrder {
+                    amount_in_base_units: 50_000,
+                    amount_out_sat: 49_500,
+                    ecx_recipient: "bc1qecx2".to_string(),
+                    reference_pubkey: "ref-1".to_string(),
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(expire_pegout_order(&conn, &created.id).await.unwrap());
+        assert_eq!(list_expired_pegout_orders_since(&conn, 0, 10).await.unwrap().len(), 1);
+        assert!(revive_expired_pegout_order(&conn, &created.id).await.unwrap());
+
+        assert!(
+            record_pegout_deposit(
+                &conn,
+                &created.id,
+                PegoutOrderStatus::DepositSeen,
+                "sol-dep-1",
+                Some("depositor-1"),
+                100_000,
+                99_000,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(is_pegout_deposit_signature(&conn, "sol-dep-1").await.unwrap());
+        assert_eq!(pegout_reserved_ecx_amount(&conn).await.unwrap(), 99_000);
+        assert!(!expire_pegout_order(&conn, &created.id).await.unwrap());
+
+        assert!(confirm_pegout_deposit(&conn, &created.id).await.unwrap());
+        assert!(!confirm_pegout_deposit(&conn, &created.id).await.unwrap());
+        assert!(claim_for_pegout_payout(&conn, &created.id).await.unwrap());
+        assert!(!claim_for_pegout_payout(&conn, &created.id).await.unwrap());
+        revert_pegout_claim(&conn, &created.id).await.unwrap();
+        assert!(claim_for_pegout_payout(&conn, &created.id).await.unwrap());
+        assert!(update_pegout_payout(&conn, &created.id, "ecx-payout-1").await.unwrap());
+        assert_eq!(pegout_reserved_ecx_amount(&conn).await.unwrap(), 0);
+        assert_eq!(completed_unwrap_amounts(&conn).await.unwrap(), vec![(100_000, 99_000)]);
+
+        // Peg-out refund path (two-phase Solana send + dust kept).
+        let refund_order = insert_pegout_order(
+            &conn,
+            &NewPegoutOrder {
+                amount_in_base_units: 10_000,
+                amount_out_sat: 200,
+                ecx_recipient: "bc1qecx2".to_string(),
+                reference_pubkey: "ref-2".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        record_pegout_deposit(
+            &conn,
+            &refund_order.id,
+            PegoutOrderStatus::DepositConfirmed,
+            "sol-dep-2",
+            Some("depositor-2"),
+            10_000,
+            200,
+        )
+        .await
+        .unwrap();
+        assert!(request_pegout_refund(&conn, &refund_order.id).await.unwrap());
+        assert!(claim_for_pegout_refund(&conn, &refund_order.id).await.unwrap());
+        assert!(!claim_for_pegout_refund(&conn, &refund_order.id).await.unwrap());
+        assert!(record_pegout_refund_signature(&conn, &refund_order.id, "sol-ref-sig").await.unwrap());
+        revert_pegout_refund_claim(&conn, &refund_order.id).await.unwrap();
+        let reverted = get_pegout_order(&conn, &refund_order.id).await.unwrap().unwrap();
+        assert_eq!(reverted.refund_signature, None);
+        assert!(claim_for_pegout_refund(&conn, &refund_order.id).await.unwrap());
+        assert!(update_pegout_refund(&conn, &refund_order.id, "sol-ref-sig-2", 100).await.unwrap());
+        assert_eq!(pegout_restocking_fees(&conn).await.unwrap(), vec![(100, 0)]);
+
+        let dust_order = insert_pegout_order(
+            &conn,
+            &NewPegoutOrder {
+                amount_in_base_units: 300,
+                amount_out_sat: 200,
+                ecx_recipient: "bc1qecx3".to_string(),
+                reference_pubkey: "ref-3".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        record_pegout_deposit(
+            &conn,
+            &dust_order.id,
+            PegoutOrderStatus::DepositConfirmed,
+            "sol-dep-3",
+            Some("depositor-3"),
+            300,
+            200,
+        )
+        .await
+        .unwrap();
+        assert!(request_pegout_refund(&conn, &dust_order.id).await.unwrap());
+        assert!(finish_pegout_refund_kept(&conn, &dust_order.id, 300).await.unwrap());
+        let mut fees = pegout_restocking_fees(&conn).await.unwrap();
+        fees.sort();
+        assert_eq!(fees, vec![(100, 0), (300, 0)]);
+        assert!(list_active_pegout_orders(&conn).await.unwrap().is_empty());
     }
 }

@@ -19,6 +19,12 @@ use crate::solana::SolanaWallet;
 use crate::wallet::ChainWallet;
 use crate::{convert, db, solana};
 
+macro_rules! eprintln_redacted {
+    ($($arg:tt)*) => {{
+        eprintln!("{}", config::redact_urls(&format!($($arg)*)));
+    }};
+}
+
 struct AppState {
     ecx: Mutex<ChainWallet>,
     solana: SolanaWallet,
@@ -96,7 +102,7 @@ fn short(id: &str) -> &str {
 /// to the log, not the response: this endpoint is public, and RPC/DB error text describes internals
 /// (hosts, account state) that a caller has no use for.
 fn internal_error(err: anyhow::Error) -> (StatusCode, String) {
-    eprintln!("[error] {err:#}");
+    eprintln_redacted!("[error] {err:#}");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
@@ -438,7 +444,7 @@ async fn create_order(
                     ),
                 ));
             }
-            eprintln!("[create_order] recipient token-account check failed: {e:#}");
+            eprintln_redacted!("[create_order] recipient token-account check failed: {e:#}");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "could not check this address's token account - retry".to_string(),
@@ -647,6 +653,14 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
     }
 
     let amount_out = settled.amount_out_base_units;
+    let (sol_stipend_lamports, sol_stipend_price_sat) = if new_status == OrderStatus::DepositConfirmed {
+        (settled.sol_stipend_lamports, settled.sol_stipend_price_sat)
+    } else {
+        (
+            order.sol_stipend_lamports.max(0) as u64,
+            order.sol_stipend_price_sat.max(0) as u64,
+        )
+    };
 
     // Conditional write (see `db::update_deposit`): `order` is a snapshot that another task may
     // already have moved past `pending`/`deposit_seen` - possibly all the way to a payout in
@@ -659,6 +673,8 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
         &deposit_txid,
         actual_amount_in,
         amount_out,
+        sol_stipend_lamports,
+        sol_stipend_price_sat,
         confs.min(min_confs),
     )
     .await?
@@ -675,6 +691,8 @@ async fn detect_deposit(state: &AppState, order: db::Order, sync: bool) -> anyho
         deposit_txid: Some(deposit_txid),
         amount_in_sat: actual_amount_in.to_sat() as i64,
         amount_out_base_units: amount_out as i64,
+        sol_stipend_lamports: sol_stipend_lamports as i64,
+        sol_stipend_price_sat: sol_stipend_price_sat as i64,
         deposit_confirmations: i64::from(confs.min(min_confs)),
         ..order
     };
@@ -927,7 +945,7 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
         Ok(p) => p,
         Err(e) => {
             // Nothing signed, let alone sent.
-            eprintln!("payout could not be prepared for order {}: {e:#}", short(&order.id));
+            eprintln_redacted!("payout could not be prepared for order {}: {e:#}", short(&order.id));
             db::revert_claim(&state.db, &order.id).await?;
             return Ok(db::Order {
                 status: OrderStatus::DepositConfirmed.label().to_string(),
@@ -939,7 +957,7 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
 
     // Durable *before* broadcast. If this write fails we have not sent anything, so unwinding is safe.
     if let Err(e) = db::record_payout_signature(&state.db, &order.id, &payout_signature).await {
-        eprintln!("could not record payout signature for order {}: {e:#}", short(&order.id));
+        eprintln_redacted!("could not record payout signature for order {}: {e:#}", short(&order.id));
         db::revert_claim(&state.db, &order.id).await?;
         return Ok(db::Order {
             status: OrderStatus::DepositConfirmed.label().to_string(),
@@ -989,7 +1007,7 @@ async fn try_fulfill(state: &AppState, order: db::Order) -> anyhow::Result<db::O
         Err(e) => {
             // Unknown outcome: the transaction may yet land. Leave it paying_out with the signature
             // recorded; `try_resolve_payout` settles it once it can be checked conclusively.
-            eprintln!(
+            eprintln_redacted!(
                 "payout for order {} has an UNKNOWN outcome ({payout_signature}): {e:#} - left \
                  paying_out for resolution",
                 short(&order.id)
@@ -1120,7 +1138,7 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     let destination = match return_address(state, &order).await {
         Ok(address) => address,
         Err(e) => {
-            eprintln!(
+            eprintln_redacted!(
                 "[try_refund] order {}: cannot yet read the address this deposit came from: {e:#}",
                 short(&order.id)
             );
@@ -1175,7 +1193,7 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     let (tx, _sent) = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
-            eprintln!("refund could not be prepared for order {}: {e:#}", short(&order.id));
+            eprintln_redacted!("refund could not be prepared for order {}: {e:#}", short(&order.id));
             db::revert_refund_claim(&state.db, &order.id).await?;
             return Ok(db::Order {
                 status: OrderStatus::RefundRequested.label().to_string(),
@@ -1187,7 +1205,7 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     let refund_txid = tx.compute_txid().to_string();
     let tx_hex = bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx);
     if let Err(e) = db::record_outbound_tx(&state.db, &order.id, WRAP_REFUND_TX, &refund_txid, &tx_hex).await {
-        eprintln!("could not record refund transaction for order {}: {e:#}", short(&order.id));
+        eprintln_redacted!("could not record refund transaction for order {}: {e:#}", short(&order.id));
         db::revert_refund_claim(&state.db, &order.id).await?;
         return Ok(db::Order {
             status: OrderStatus::RefundRequested.label().to_string(),
@@ -1198,7 +1216,7 @@ async fn try_refund(state: &AppState, order: db::Order) -> anyhow::Result<db::Or
     // this transaction rather than signing a different one.
     let fee_sat = state.ecx.lock().await.change_value(&tx);
     if let Err(e) = state.ecx.lock().await.submit_signed_transfer(tx).await {
-        eprintln!(
+        eprintln_redacted!(
             "refund broadcast for order {} is unresolved ({refund_txid}): {e:#} - will retry the saved transaction",
             short(&order.id)
         );
@@ -1453,7 +1471,7 @@ async fn try_fulfill_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow:
     let tx = match prepared {
         Ok(tx) => tx,
         Err(e) => {
-            eprintln!("payout could not be prepared for pegout order {}: {e:#}", short(&order.id));
+            eprintln_redacted!("payout could not be prepared for pegout order {}: {e:#}", short(&order.id));
             db::revert_pegout_claim(&state.db, &order.id).await?;
             return Ok(db::PegoutOrder {
                 status: PegoutOrderStatus::DepositConfirmed.label().to_string(),
@@ -1464,7 +1482,7 @@ async fn try_fulfill_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow:
     let payout_txid = tx.compute_txid().to_string();
     let tx_hex = bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx);
     if let Err(e) = db::record_outbound_tx(&state.db, &order.id, UNWRAP_PAYOUT_TX, &payout_txid, &tx_hex).await {
-        eprintln!("could not record pegout payout transaction for order {}: {e:#}", short(&order.id));
+        eprintln_redacted!("could not record pegout payout transaction for order {}: {e:#}", short(&order.id));
         db::revert_pegout_claim(&state.db, &order.id).await?;
         return Ok(db::PegoutOrder {
             status: PegoutOrderStatus::DepositConfirmed.label().to_string(),
@@ -1472,7 +1490,7 @@ async fn try_fulfill_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow:
         });
     }
     if let Err(e) = state.ecx.lock().await.submit_signed_transfer(tx).await {
-        eprintln!(
+        eprintln_redacted!(
             "pegout payout broadcast for order {} is unresolved ({payout_txid}): {e:#} - will retry the saved transaction",
             short(&order.id)
         );
@@ -1565,7 +1583,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
     {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("pegout refund could not be prepared for order {}: {e:#}", short(&order.id));
+            eprintln_redacted!("pegout refund could not be prepared for order {}: {e:#}", short(&order.id));
             db::revert_pegout_refund_claim(&state.db, &order.id).await?;
             return Ok(db::PegoutOrder {
                 status: PegoutOrderStatus::RefundRequested.label().to_string(),
@@ -1576,7 +1594,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
     let refund_signature = prepared.signature.to_string();
 
     if let Err(e) = db::record_pegout_refund_signature(&state.db, &order.id, &refund_signature).await {
-        eprintln!("could not record pegout refund signature for order {}: {e:#}", short(&order.id));
+        eprintln_redacted!("could not record pegout refund signature for order {}: {e:#}", short(&order.id));
         db::revert_pegout_refund_claim(&state.db, &order.id).await?;
         return Ok(db::PegoutOrder {
             status: PegoutOrderStatus::RefundRequested.label().to_string(),
@@ -1624,7 +1642,7 @@ async fn try_refund_pegout(state: &AppState, order: db::PegoutOrder) -> anyhow::
             })
         }
         Err(e) => {
-            eprintln!(
+            eprintln_redacted!(
                 "pegout refund for order {} has an UNKNOWN outcome ({refund_signature}): {e:#} - \
                  left refunding for resolution",
                 short(&order.id)
@@ -1942,21 +1960,21 @@ async fn run_order_poller(state: Arc<AppState>) {
     loop {
         ticker.tick().await;
         if let Err(error) = sweep_earnings_once(&state).await {
-            eprintln!("[earnings] sweep check failed: {error:#}");
+            eprintln_redacted!("[earnings] sweep check failed: {error:#}");
         }
         if let Err(e) = poll_orders_once(&state).await {
-            eprintln!("order poll failed: {e:#}");
+            eprintln_redacted!("order poll failed: {e:#}");
         }
         if let Err(e) = poll_pegout_orders_once(&state).await {
-            eprintln!("pegout order poll failed: {e:#}");
+            eprintln_redacted!("pegout order poll failed: {e:#}");
         }
         // After the peg-out pass, so a deposit that does carry a reference has been attributed to
         // its order before the treasury-wide scan looks at the same transaction.
         if let Err(e) = scan_unmatched_deposits_once(&state).await {
-            eprintln!("[unmatched] scan failed: {e:#}");
+            eprintln_redacted!("[unmatched] scan failed: {e:#}");
         }
         if let Err(e) = refund_unmatched_deposits_once(&state).await {
-            eprintln!("[unmatched] refund pass failed: {e:#}");
+            eprintln_redacted!("[unmatched] refund pass failed: {e:#}");
         }
     }
 }
@@ -2211,7 +2229,7 @@ async fn refund_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> 
         let recipient = match solana::parse_pubkey(owner).and_then(|pk| state.solana.validate_recipient(&pk).map(|()| pk)) {
             Ok(pk) => pk,
             Err(e) => {
-                eprintln!("[unmatched] deposit {signature}: sender {owner} cannot be refunded ({e}) - holding");
+                eprintln_redacted!("[unmatched] deposit {signature}: sender {owner} cannot be refunded ({e}) - holding");
                 db::hold_unmatched_deposit(&state.db, &signature, "the sending wallet cannot receive a refund").await?;
                 continue;
             }
@@ -2226,14 +2244,14 @@ async fn refund_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> 
         let prepared = match state.solana.prepare_wecx_transfer(recipient, deposit.refund_base_units, 0).await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[unmatched] deposit {signature}: refund could not be prepared: {e:#}");
+                eprintln_redacted!("[unmatched] deposit {signature}: refund could not be prepared: {e:#}");
                 db::revert_unmatched_refund_claim(&state.db, &signature).await?;
                 continue;
             }
         };
         let refund_signature = prepared.signature.to_string();
         if let Err(e) = db::record_unmatched_refund_signature(&state.db, &signature, &refund_signature).await {
-            eprintln!("[unmatched] deposit {signature}: could not record refund signature: {e:#}");
+            eprintln_redacted!("[unmatched] deposit {signature}: could not record refund signature: {e:#}");
             db::revert_unmatched_refund_claim(&state.db, &signature).await?;
             continue;
         }
@@ -2251,7 +2269,7 @@ async fn refund_unmatched_deposits_once(state: &AppState) -> anyhow::Result<()> 
                 db::revert_unmatched_refund_claim(&state.db, &signature).await?;
             }
             Err(e) => {
-                eprintln!("[unmatched] deposit {signature}: refund {refund_signature} has an UNKNOWN outcome: {e:#} - left refunding for resolution");
+                eprintln_redacted!("[unmatched] deposit {signature}: refund {refund_signature} has an UNKNOWN outcome: {e:#} - left refunding for resolution");
             }
         }
     }
@@ -2414,21 +2432,21 @@ async fn poll_pegout_orders_once(state: &AppState) -> anyhow::Result<()> {
             match check_pegout_deposit(state, order, true).await {
                 Ok(updated) if PegoutOrderStatus::from_label(&updated.status).ok() == Some(PegoutOrderStatus::Pending) => {
                     if let Err(e) = db::expire_pegout_order(&state.db, &id).await {
-                        eprintln!("failed to expire pegout order {}: {e:#}", short(&id));
+                        eprintln_redacted!("failed to expire pegout order {}: {e:#}", short(&id));
                     }
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("pegout order poll error for {}: {e:#} - not expiring", short(&id)),
+                Err(e) => eprintln_redacted!("pegout order poll error for {}: {e:#} - not expiring", short(&id)),
             }
             continue;
         }
 
         if let Err(e) = check_pegout_deposit(state, order, true).await {
-            eprintln!("pegout order poll error for {}: {e:#}", short(&id));
+            eprintln_redacted!("pegout order poll error for {}: {e:#}", short(&id));
         }
     }
     if let Err(e) = revive_late_pegouts(state).await {
-        eprintln!("[poll] late pegout revival failed: {e:#}");
+        eprintln_redacted!("[poll] late pegout revival failed: {e:#}");
     }
     Ok(())
 }
@@ -2459,7 +2477,7 @@ async fn poll_orders_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
     if let Err(e) = sync_scripts_in_chunks(state, scripts).await {
-        eprintln!("[poll] ecx sync failed: {e:#}");
+        eprintln_redacted!("[poll] ecx sync failed: {e:#}");
     }
 
     for order in active {
@@ -2475,21 +2493,21 @@ async fn poll_orders_once(state: &AppState) -> anyhow::Result<()> {
             match check_deposit(state, order, false).await {
                 Ok(updated) if OrderStatus::from_label(&updated.status).ok() == Some(OrderStatus::Pending) => {
                     if let Err(e) = db::expire_order(&state.db, &id).await {
-                        eprintln!("failed to expire order {}: {e:#}", short(&id));
+                        eprintln_redacted!("failed to expire order {}: {e:#}", short(&id));
                     }
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("order poll error for {}: {e:#} - not expiring", short(&id)),
+                Err(e) => eprintln_redacted!("order poll error for {}: {e:#} - not expiring", short(&id)),
             }
             continue;
         }
 
         if let Err(e) = check_deposit(state, order, false).await {
-            eprintln!("order poll error for {}: {e:#}", short(&id));
+            eprintln_redacted!("order poll error for {}: {e:#}", short(&id));
         }
     }
     if let Err(e) = revive_late_wraps(state).await {
-        eprintln!("[poll] late wrap revival failed: {e:#}");
+        eprintln_redacted!("[poll] late wrap revival failed: {e:#}");
     }
     Ok(())
 }
@@ -2575,13 +2593,13 @@ async fn revive_late_wraps(state: &AppState) -> anyhow::Result<()> {
         .map(|address| address.assume_checked().script_pubkey())
         .collect();
     if let Err(e) = sync_scripts_in_chunks(state, scripts).await {
-        eprintln!("[poll] late-deposit sync failed: {e:#}");
+        eprintln_redacted!("[poll] late-deposit sync failed: {e:#}");
         return Ok(());
     }
     for order in expired {
         let id = order.id.clone();
         if let Err(e) = revive_wrap_if_funded(state, order, false).await {
-            eprintln!("[poll] expired order {} could not be revived: {e:#}", short(&id));
+            eprintln_redacted!("[poll] expired order {} could not be revived: {e:#}", short(&id));
         }
     }
     Ok(())
@@ -2593,7 +2611,7 @@ async fn revive_late_pegouts(state: &AppState) -> anyhow::Result<()> {
     for order in db::list_expired_pegout_orders_since(&state.db, since, 50).await? {
         let id = order.id.clone();
         if let Err(e) = revive_pegout_if_funded(state, order, true).await {
-            eprintln!("[poll] expired pegout {} could not be revived: {e:#}", short(&id));
+            eprintln_redacted!("[poll] expired pegout {} could not be revived: {e:#}", short(&id));
         }
     }
     Ok(())
@@ -2658,6 +2676,80 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_XPRV: &str = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+
+    struct TestEnv {
+        dir: std::path::PathBuf,
+        state: Arc<AppState>,
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    async fn test_env() -> TestEnv {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("server-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ChainConfig {
+            network: bdk_wallet::bitcoin::Network::Bitcoin,
+            backend: config::Backend::Esplora,
+            esplora_url: "http://127.0.0.1:9".to_string(),
+            electrum_url: String::new(),
+            db_path: dir.join("ecx.db"),
+        };
+        let ecx = ChainWallet::open(
+            &config,
+            &format!("wpkh({TEST_XPRV}/84h/0h/0h/0/*)"),
+            &format!("wpkh({TEST_XPRV}/84h/0h/0h/1/*)"),
+        )
+        .unwrap();
+        let solana = SolanaWallet::for_test(Keypair::new(), Keypair::new().pubkey(), 8);
+        let db = db::Connection::in_memory_for_test().await;
+        let state = Arc::new(AppState {
+            ecx: Mutex::new(ecx),
+            solana,
+            db,
+            limits: Limits::default(),
+            stats_cache: Mutex::new(None),
+            earnings: None,
+            money_operations: Mutex::new(()),
+        });
+        TestEnv { dir, state }
+    }
+
+    fn funding_tx(outputs: Vec<(ScriptBuf, u64)>, seed: u8) -> bdk_wallet::bitcoin::Transaction {
+        use bdk_wallet::bitcoin::absolute::LockTime;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::transaction::Version;
+        use bdk_wallet::bitcoin::{Sequence, TxIn, TxOut, Txid, Witness};
+
+        bdk_wallet::bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_slice(&[seed; 32]).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outputs
+                .into_iter()
+                .map(|(script_pubkey, sats)| TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey,
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn earnings_include_history_and_subtract_reserved_sweeps() {
@@ -2671,6 +2763,7 @@ mod tests {
 
     #[test]
     fn order_creation_limit_admits_up_to_the_cap_then_refuses() {
+        let _guard = config::env_lock();
         unsafe {
             std::env::set_var("ORDERS_PER_MINUTE", "3");
         }
@@ -2690,6 +2783,7 @@ mod tests {
 
     #[test]
     fn get_sync_is_throttled_to_one_per_interval() {
+        let _guard = config::env_lock();
         let limits = Limits::default();
         assert!(limits.allow_get_sync());
         assert!(!limits.allow_get_sync());
@@ -2697,6 +2791,7 @@ mod tests {
 
     #[test]
     fn payout_viable_requires_the_minimum_and_a_nonzero_output() {
+        let _guard = config::env_lock();
         let min = config::min_deposit_amount().to_sat();
         assert!(payout_viable(min, 1));
         assert!(!payout_viable(min - 1, 1_000), "below-minimum deposits must not be paid out");
@@ -2705,6 +2800,7 @@ mod tests {
 
     #[test]
     fn pegout_payout_viable_requires_the_minimum() {
+        let _guard = config::env_lock();
         let min = config::min_deposit_amount().to_sat();
         assert!(pegout_payout_viable(min));
         assert!(!pegout_payout_viable(min - 1));
@@ -2753,5 +2849,260 @@ mod tests {
             "a refund below the floor is kept whole as the fee");
         let one_unit = decide_unmatched(&UnmatchedFacts { amount_base_units: 1, ..base });
         assert_eq!(one_unit.status, UnmatchedStatus::Kept);
+    }
+
+    #[tokio::test]
+    async fn detect_deposit_sums_multiple_outputs_and_drops_unpaid_stipend_on_confirmation() {
+        let env = test_env().await;
+        let deposit_addr = env.state.ecx.lock().await.fresh_address().unwrap();
+        let recipient = Keypair::new().pubkey().to_string();
+
+        // Order created with a 500_000-sat SOL stipend, but the customer only deposits 400_000 sat
+        // across two outputs (100_000 + 300_000).
+        let order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 100_500_000,
+                amount_out_base_units: 98_999_010,
+                deposit_address: deposit_addr.to_string(),
+                solana_recipient: recipient,
+                sol_stipend_lamports: 5_000_000,
+                sol_stipend_price_sat: 500_000,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let tx1 = funding_tx(vec![(deposit_addr.script_pubkey(), 100_000)], 1);
+        let tx2 = funding_tx(vec![(deposit_addr.script_pubkey(), 300_000)], 2);
+        let tx2_id = tx2.compute_txid().to_string();
+        {
+            let mut wallet = env.state.ecx.lock().await;
+            wallet.apply_unconfirmed_for_test(tx1.clone(), 1_700_000_000);
+            wallet.apply_unconfirmed_for_test(tx2.clone(), 1_700_000_000);
+        }
+
+        // Unconfirmed: transitions to deposit_seen, sums both outputs, and preserves the stipend
+        // offer on the row in case another payment lands before confirmation.
+        let seen = detect_deposit(&env.state, order, false).await.unwrap();
+        assert_eq!(seen.status, "deposit_seen");
+        assert_eq!(seen.amount_in_sat, 400_000);
+        assert_eq!(seen.deposit_txid.as_deref(), Some(tx2_id.as_str()));
+        assert_eq!(seen.sol_stipend_lamports, 5_000_000);
+        assert_eq!(seen.sol_stipend_price_sat, 500_000);
+
+        // Confirmed at depth 3: drops the unpaid stipend so completed_wrap_amounts and unswept_fees
+        // do not subtract an unpaid 500_000-sat stipend from a 400_000-sat deposit.
+        {
+            let mut wallet = env.state.ecx.lock().await;
+            wallet.confirm_tx_for_test(tx1, 100, 102);
+            wallet.confirm_tx_for_test(tx2, 100, 102);
+        }
+        let confirmed = detect_deposit(&env.state, seen, false).await.unwrap();
+        assert_eq!(confirmed.status, "deposit_confirmed");
+        assert_eq!(confirmed.sol_stipend_lamports, 0);
+        assert_eq!(confirmed.sol_stipend_price_sat, 0);
+        let expected_out = convert::pegin_payout_base_units(
+            400_000,
+            8,
+            config::pegin_fee_bps(),
+            config::pegin_flat_fee_sat(),
+        );
+        assert_eq!(confirmed.amount_out_base_units, expected_out as i64);
+
+        // Simulate payout completion and verify earnings calculation succeeds without underflow.
+        assert!(db::claim_for_payout(&env.state.db, &confirmed.id).await.unwrap());
+        assert!(db::update_payout(&env.state.db, &confirmed.id, "sol-sig").await.unwrap());
+        let completed = db::completed_wrap_amounts(&env.state.db).await.unwrap();
+        assert_eq!(completed, vec![(400_000, expected_out)]);
+        assert_eq!(unswept_fees(&completed, 0).unwrap(), 400_000 - expected_out);
+    }
+
+    #[tokio::test]
+    async fn detect_deposit_routes_uncovered_rent_and_dust_to_refund() {
+        let env = test_env().await;
+
+        // 1. Deposit cannot cover locked ATA rent price -> refund_requested.
+        let rent_addr = env.state.ecx.lock().await.fresh_address().unwrap();
+        let rent_order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 1_203_928,
+                amount_out_base_units: 989_010,
+                deposit_address: rent_addr.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 2_039_280,
+                ata_rent_price_sat: 203_928,
+            },
+        )
+        .await
+        .unwrap();
+        let short_rent_tx = funding_tx(vec![(rent_addr.script_pubkey(), 200_000)], 10);
+        env.state.ecx.lock().await.confirm_tx_for_test(short_rent_tx, 50, 55);
+        let after_rent = detect_deposit(&env.state, rent_order, false).await.unwrap();
+        assert_eq!(after_rent.status, "refund_requested");
+        assert!(after_rent.refund_reason.contains("formatted wrong"));
+
+        // 2. Deposit below minimum -> refund_requested.
+        let dust_addr = env.state.ecx.lock().await.fresh_address().unwrap();
+        let dust_order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 100_000,
+                amount_out_base_units: 98_010,
+                deposit_address: dust_addr.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let dust_tx = funding_tx(vec![(dust_addr.script_pubkey(), 300)], 11);
+        env.state.ecx.lock().await.confirm_tx_for_test(dust_tx, 50, 55);
+        let after_dust = detect_deposit(&env.state, dust_order, false).await.unwrap();
+        assert_eq!(after_dust.status, "refund_requested");
+    }
+
+    #[tokio::test]
+    async fn protected_outpoints_cover_unsettled_and_expired_orders_but_exclude_refund_target() {
+        let env = test_env().await;
+        let (addr_pending, addr_expired, addr_paid) = {
+            let mut wallet = env.state.ecx.lock().await;
+            (
+                wallet.fresh_address().unwrap(),
+                wallet.fresh_address().unwrap(),
+                wallet.fresh_address().unwrap(),
+            )
+        };
+
+        let pending_order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 50_000,
+                amount_out_base_units: 48_510,
+                deposit_address: addr_pending.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let expired_order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 60_000,
+                amount_out_base_units: 58_410,
+                deposit_address: addr_expired.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        db::expire_order(&env.state.db, &expired_order.id).await.unwrap();
+
+        let paid_order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 70_000,
+                amount_out_base_units: 68_310,
+                deposit_address: addr_paid.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        db::update_deposit(
+            &env.state.db,
+            &paid_order.id,
+            OrderStatus::DepositConfirmed,
+            "tx-paid",
+            Amount::from_sat(70_000),
+            68_310,
+            0,
+            0,
+            3,
+        )
+        .await
+        .unwrap();
+        db::claim_for_payout(&env.state.db, &paid_order.id).await.unwrap();
+        db::update_payout(&env.state.db, &paid_order.id, "sig-paid").await.unwrap();
+
+        let tx_pending = funding_tx(vec![(addr_pending.script_pubkey(), 50_000)], 21);
+        let tx_expired = funding_tx(vec![(addr_expired.script_pubkey(), 60_000)], 22);
+        let tx_paid = funding_tx(vec![(addr_paid.script_pubkey(), 70_000)], 23);
+        let op_pending = OutPoint { txid: tx_pending.compute_txid(), vout: 0 };
+        let op_expired = OutPoint { txid: tx_expired.compute_txid(), vout: 0 };
+        let op_paid = OutPoint { txid: tx_paid.compute_txid(), vout: 0 };
+        {
+            let mut wallet = env.state.ecx.lock().await;
+            wallet.confirm_tx_for_test(tx_pending, 10, 15);
+            wallet.confirm_tx_for_test(tx_expired, 10, 15);
+            wallet.confirm_tx_for_test(tx_paid, 10, 15);
+        }
+
+        let wallet = env.state.ecx.lock().await;
+        let all_protected = protected_deposit_outpoints(&env.state.db, &wallet, None).await.unwrap();
+        assert!(all_protected.contains(&op_pending));
+        assert!(all_protected.contains(&op_expired), "expired order deposits must stay protected from coin selection");
+        assert!(!all_protected.contains(&op_paid), "paid_out order deposits are treasury float");
+
+        let excluding_pending = protected_deposit_outpoints(&env.state.db, &wallet, Some(&pending_order.id))
+            .await
+            .unwrap();
+        assert!(!excluding_pending.contains(&op_pending), "excluded order must be spendable for its own refund");
+        assert!(excluding_pending.contains(&op_expired));
+    }
+
+    #[tokio::test]
+    async fn expired_wrap_order_revives_when_late_deposit_arrives() {
+        let env = test_env().await;
+        let deposit_addr = env.state.ecx.lock().await.fresh_address().unwrap();
+        let order = db::insert_order(
+            &env.state.db,
+            &db::NewOrder {
+                amount_in_sat: 50_000,
+                amount_out_base_units: 48_510,
+                deposit_address: deposit_addr.to_string(),
+                solana_recipient: Keypair::new().pubkey().to_string(),
+                sol_stipend_lamports: 0,
+                sol_stipend_price_sat: 0,
+                ata_rent_lamports: 0,
+                ata_rent_price_sat: 0,
+            },
+        )
+        .await
+        .unwrap();
+        db::expire_order(&env.state.db, &order.id).await.unwrap();
+        let expired = db::get_order(&env.state.db, &order.id).await.unwrap().unwrap();
+        assert_eq!(expired.status, "expired");
+
+        // Unfunded expired order stays expired.
+        let still_expired = revive_wrap_if_funded(&env.state, expired.clone(), false).await.unwrap();
+        assert_eq!(still_expired.status, "expired");
+
+        // Late deposit lands -> revives and advances straight to deposit_confirmed.
+        let tx = funding_tx(vec![(deposit_addr.script_pubkey(), 50_000)], 31);
+        env.state.ecx.lock().await.confirm_tx_for_test(tx, 20, 25);
+        let revived = revive_wrap_if_funded(&env.state, expired, false).await.unwrap();
+        assert_eq!(revived.status, "deposit_confirmed");
+        assert_eq!(revived.amount_in_sat, 50_000);
     }
 }

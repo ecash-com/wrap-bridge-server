@@ -180,7 +180,17 @@ fn require_live_confirmation(confirmed: bool, description: &str) -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {}", config::redact_urls(&format!("{error:#}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 

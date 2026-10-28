@@ -12,6 +12,7 @@ user and only ever sees the text this program sends it.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,7 +45,8 @@ def recent_errors():
                "[unmatched]", "held", "lost contact", "panicked")
     lines = [l for l in text.splitlines() if any(m in l.lower() for m in markers)]
     lines = lines[-MAX_LOG_LINES:]
-    return "\n".join(lines) if lines else "(no error lines in the last 400 backend journal lines)"
+    redacted = [re.sub(r"https?://[^\s)\]\}>\x22]+", "[redacted URL]", line) for line in lines]
+    return "\n".join(redacted) if redacted else "(no error lines in the last 400 backend journal lines)"
 
 
 def ensure_model_running():

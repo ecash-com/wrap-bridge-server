@@ -53,6 +53,12 @@ impl SolanaWallet {
         Ok(Self { rpc, payer, mint, decimals: supply.decimals })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(payer: Keypair, mint: Pubkey, decimals: u8) -> Self {
+        let rpc = RpcClient::new_with_commitment("http://127.0.0.1:9".to_string(), CommitmentConfig::confirmed());
+        Self { rpc, payer, mint, decimals }
+    }
+
     pub fn pubkey(&self) -> Pubkey {
         self.payer.pubkey()
     }
@@ -218,7 +224,11 @@ impl SolanaWallet {
         // delivered it; a preflight rejection means it never can land) - the status/expiry polling
         // below is what decides, so just log and carry on.
         if let Err(e) = self.rpc.send_transaction_with_config(&prepared.tx, send_config).await {
-            eprintln!("[solana] initial send of {} reported: {e}", prepared.signature);
+            eprintln!(
+                "[solana] initial send of {} reported: {}",
+                prepared.signature,
+                crate::config::redact_urls(&e.to_string())
+            );
         }
 
         let mut last_send = Instant::now();
@@ -755,6 +765,87 @@ fn recipient_problem(recipient: &Pubkey, reserved: &[Pubkey], allow_off_curve: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_transaction_status_client_types::option_serializer::OptionSerializer;
+    use solana_transaction_status_client_types::{
+        EncodedTransactionWithStatusMeta, UiRawMessage, UiTransaction,
+        UiTransactionStatusMeta, UiTransactionTokenBalance,
+    };
+
+    fn token_balance(account_index: u8, mint: &Pubkey, owner: Option<&Pubkey>, amount: u64) -> UiTransactionTokenBalance {
+        let owner_line = match owner {
+            Some(pk) => format!("owner = \"{pk}\"\n"),
+            None => String::new(),
+        };
+        let doc = format!(
+            "accountIndex = {account_index}\n\
+             mint = \"{mint}\"\n\
+             {owner_line}\
+             programId = \"{}\"\n\
+             [uiTokenAmount]\n\
+             amount = \"{amount}\"\n\
+             decimals = 8\n\
+             uiAmountString = \"{amount}\"\n",
+            spl_token::id()
+        );
+        toml::from_str(&doc).unwrap()
+    }
+
+    fn build_encoded_tx(
+        static_keys: Vec<String>,
+        loaded: Option<UiLoadedAddresses>,
+        pre_balances: Vec<UiTransactionTokenBalance>,
+        post_balances: Vec<UiTransactionTokenBalance>,
+        failed: bool,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let mut meta = UiTransactionStatusMeta {
+            err: if failed {
+                Some(solana_sdk::transaction::TransactionError::AccountNotFound)
+            } else {
+                None
+            },
+            status: if failed {
+                Err(solana_sdk::transaction::TransactionError::AccountNotFound)
+            } else {
+                Ok(())
+            },
+            fee: 5_000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::Skip,
+            log_messages: OptionSerializer::Skip,
+            pre_token_balances: OptionSerializer::Some(pre_balances),
+            post_token_balances: OptionSerializer::Some(post_balances),
+            rewards: OptionSerializer::Skip,
+            loaded_addresses: match loaded {
+                Some(l) => OptionSerializer::Some(l),
+                None => OptionSerializer::Skip,
+            },
+            return_data: OptionSerializer::Skip,
+            compute_units_consumed: OptionSerializer::Skip,
+            cost_units: OptionSerializer::Skip,
+        };
+        if failed {
+            meta.err = Some(solana_sdk::transaction::TransactionError::AccountNotFound);
+        }
+        EncodedConfirmedTransactionWithStatusMeta {
+            slot: 1,
+            block_time: Some(1_700_000_000),
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec![Signature::default().to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: solana_sdk::message::MessageHeader::default(),
+                        account_keys: static_keys,
+                        recent_blockhash: String::new(),
+                        instructions: vec![],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(meta),
+                version: None,
+            },
+        }
+    }
 
     #[test]
     fn ordinary_wallet_address_is_accepted() {
@@ -763,16 +854,33 @@ mod tests {
     }
 
     #[test]
-    fn sol_amount_to_lamports_round_trips() {
+    fn sol_amount_to_lamports_round_trips_and_rejects_malformed_inputs() {
+        assert_eq!(parse_lamports_from_sol("0").unwrap(), 0);
         assert_eq!(parse_lamports_from_sol("0.003").unwrap(), 3_000_000);
-        assert_eq!(parse_lamports_from_sol("1.0").unwrap(), 1_000_000_000);
+        assert_eq!(parse_lamports_from_sol("  1.000000000 ").unwrap(), 1_000_000_000);
+        assert_eq!(parse_lamports_from_sol("0.000000001").unwrap(), 1);
+        for invalid in ["", ".", ".5", "-0.1", "0.0000000001", "1.2.3", "abc", "18446744073709551615"] {
+            assert!(parse_lamports_from_sol(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
     fn reserved_addresses_are_rejected() {
         let mint = Keypair::new().pubkey();
-        assert!(recipient_problem(&mint, &[mint], false).is_some());
-        assert!(recipient_problem(&spl_token::id(), &[spl_token::id()], true).is_some());
+        let payer = Keypair::new();
+        let treasury = payer.pubkey();
+        let wallet = SolanaWallet::for_test(payer, mint, 8);
+        for forbidden in [
+            solana_sdk::system_program::id(),
+            spl_token::id(),
+            spl_associated_token_account::id(),
+            mint,
+            treasury,
+        ] {
+            assert!(wallet.validate_recipient(&forbidden).is_err(), "accepted {forbidden}");
+        }
+        let user = Keypair::new().pubkey();
+        assert!(wallet.validate_recipient(&user).is_ok());
     }
 
     #[test]
@@ -781,5 +889,87 @@ mod tests {
         assert!(!pda.is_on_curve());
         assert!(recipient_problem(&pda, &[], false).is_some());
         assert!(recipient_problem(&pda, &[], true).is_none());
+    }
+
+    #[test]
+    fn keypair_from_env_decodes_valid_secret_and_rejects_bad_inputs() {
+        let generated = Keypair::new();
+        let base58 = generated.to_base58_string();
+        let decoded = keypair_from_env(&format!("  {base58}\n")).unwrap();
+        assert_eq!(decoded.pubkey(), generated.pubkey());
+
+        assert!(keypair_from_env("not-valid-base58-!!!").is_err());
+        assert!(keypair_from_env(&bs58::encode([1u8; 32]).into_string()).is_err());
+    }
+
+    #[test]
+    fn parse_reference_deposit_extracts_delta_owner_and_loaded_addresses() {
+        let payer = Keypair::new();
+        let mint = Keypair::new().pubkey();
+        let wallet = SolanaWallet::for_test(payer, mint, 8);
+        let treasury_ata = wallet.treasury_ata();
+        let customer = Keypair::new().pubkey();
+        let customer_ata = get_associated_token_address(&customer, &mint);
+        let reference = Keypair::new().pubkey();
+        let sig = Signature::new_unique();
+
+        // Standard deposit where treasury ATA already had 1_000 units and receives 25_000 more,
+        // and the reference key arrives via a v0 address lookup table.
+        let tx = build_encoded_tx(
+            vec![customer.to_string(), customer_ata.to_string(), treasury_ata.to_string()],
+            Some(UiLoadedAddresses {
+                writable: vec![],
+                readonly: vec![reference.to_string()],
+            }),
+            vec![
+                token_balance(1, &mint, Some(&customer), 100_000),
+                token_balance(2, &mint, Some(&wallet.pubkey()), 1_000),
+            ],
+            vec![
+                token_balance(1, &mint, Some(&customer), 75_000),
+                token_balance(2, &mint, Some(&wallet.pubkey()), 26_000),
+            ],
+            false,
+        );
+        let parsed = wallet.parse_reference_deposit(&tx, sig, true).unwrap().unwrap();
+        assert_eq!(parsed.signature, sig);
+        assert_eq!(parsed.amount_base_units, 25_000);
+        assert_eq!(parsed.depositor_owner, Some(customer));
+        assert!(parsed.finalized);
+        assert!(parsed.account_keys.contains(&reference.to_string()));
+
+        // First-ever deposit to treasury ATA (no pre_token_balances entry for treasury) and source
+        // token account closed in the same transaction (absent from post_token_balances).
+        let first_tx = build_encoded_tx(
+            vec![customer_ata.to_string(), treasury_ata.to_string()],
+            None,
+            vec![token_balance(0, &mint, Some(&customer), 50_000)],
+            vec![token_balance(1, &mint, Some(&wallet.pubkey()), 50_000)],
+            false,
+        );
+        let first = wallet.parse_reference_deposit(&first_tx, sig, false).unwrap().unwrap();
+        assert_eq!(first.amount_base_units, 50_000);
+        assert_eq!(first.depositor_owner, Some(customer));
+        assert!(!first.finalized);
+
+        // Failed transaction on-chain must never be treated as a deposit.
+        let failed_tx = build_encoded_tx(
+            vec![customer_ata.to_string(), treasury_ata.to_string()],
+            None,
+            vec![token_balance(0, &mint, Some(&customer), 50_000)],
+            vec![token_balance(1, &mint, Some(&wallet.pubkey()), 50_000)],
+            true,
+        );
+        assert!(wallet.parse_reference_deposit(&failed_tx, sig, true).unwrap().is_none());
+
+        // Outbound treasury transfer (balance decreased, did not increase) returns None.
+        let outbound_tx = build_encoded_tx(
+            vec![treasury_ata.to_string()],
+            None,
+            vec![token_balance(0, &mint, Some(&wallet.pubkey()), 50_000)],
+            vec![token_balance(0, &mint, Some(&wallet.pubkey()), 40_000)],
+            false,
+        );
+        assert!(wallet.parse_reference_deposit(&outbound_tx, sig, true).unwrap().is_none());
     }
 }

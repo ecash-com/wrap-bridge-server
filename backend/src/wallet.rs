@@ -388,7 +388,8 @@ impl ChainWallet {
                         ),
                         Err(e) => eprintln!(
                             "[verify_unspent] failed to fetch spending tx {txid}, will re-check \
-                             next call: {e}"
+                             next call: {}",
+                            crate::config::redact_urls(&e.to_string())
                         ),
                     }
                 }
@@ -712,6 +713,50 @@ impl ChainWallet {
             bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn apply_unconfirmed_for_test(&mut self, tx: Transaction, seen_at: u64) {
+        self.inner.apply_unconfirmed_txs([(tx, seen_at)]);
+        self.inner.persist(&mut self.store).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_tx_for_test(&mut self, tx: Transaction, block_height: u32, tip_height: u32) {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+
+        let anchor_hash = BlockHash::from_byte_array([1u8; 32]);
+        let tip_hash = if tip_height == block_height {
+            anchor_hash
+        } else {
+            BlockHash::from_byte_array([2u8; 32])
+        };
+        let mut cp = self.inner.latest_checkpoint();
+        for (height, hash) in [(block_height, anchor_hash), (tip_height, tip_hash)] {
+            cp = cp.insert(BlockId { height, hash });
+        }
+        let mut graph = bdk_wallet::chain::TxGraph::default();
+        let txid = tx.compute_txid();
+        let _ = graph.insert_tx(tx);
+        let _ = graph.insert_anchor(
+            txid,
+            ConfirmationBlockTime {
+                block_id: BlockId {
+                    height: block_height,
+                    hash: anchor_hash,
+                },
+                confirmation_time: 1_700_000_000,
+            },
+        );
+        let update = bdk_wallet::Update {
+            tx_update: graph.into(),
+            chain: Some(cp),
+            ..Default::default()
+        };
+        self.inner.apply_update(update).unwrap();
+        self.inner.persist(&mut self.store).unwrap();
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -960,5 +1005,167 @@ mod ownership_tests {
             "a deposit funded only by this wallet has nowhere to return it"
         );
         assert_eq!(dominant_return_address(&[], |_| false), None);
+    }
+
+    fn dummy_funding_tx(outputs: Vec<(ScriptBuf, u64)>, seed: u8) -> Transaction {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::transaction::Version;
+        use bdk_wallet::bitcoin::{Sequence, TxIn, TxOut, Witness};
+
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_slice(&[seed; 32]).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outputs
+                .into_iter()
+                .map(|(script_pubkey, sats)| TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn prepare_return_spends_only_deposit_utxos_and_tracks_restocking_fee_change() {
+        let dir = std::env::temp_dir().join(format!("wallet-return-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ChainConfig {
+            network: Network::Bitcoin,
+            backend: Backend::Esplora,
+            esplora_url: "http://127.0.0.1:9".to_string(),
+            electrum_url: String::new(),
+            db_path: dir.join("ecx.db"),
+        };
+        let mut wallet = ChainWallet::open(
+            &config,
+            &format!("wpkh({XPRV}/84h/0h/0h/0/*)"),
+            &format!("wpkh({XPRV}/84h/0h/0h/1/*)"),
+        )
+        .unwrap();
+
+        let treasury_addr = wallet.fresh_address().unwrap();
+        let deposit_addr = wallet.fresh_address().unwrap();
+        let customer_return: Address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+            .parse::<Address<_>>()
+            .unwrap()
+            .require_network(Network::Bitcoin)
+            .unwrap();
+
+        let treasury_tx = dummy_funding_tx(vec![(treasury_addr.script_pubkey(), 5_000_000)], 11);
+        let deposit_tx = dummy_funding_tx(vec![(deposit_addr.script_pubkey(), 100_000)], 22);
+        let deposit_txid = deposit_tx.compute_txid();
+        wallet.confirm_tx_for_test(treasury_tx, 100, 102);
+        wallet.confirm_tx_for_test(deposit_tx, 100, 102);
+        assert_eq!(wallet.confirmations(deposit_txid), 3);
+
+        let deposit_outpoint = OutPoint {
+            txid: deposit_txid,
+            vout: 0,
+        };
+        let (tx, sent) = wallet
+            .prepare_return_from_deposits(
+                &customer_return,
+                &[deposit_outpoint],
+                99_000,
+                FeeRate::from_sat_per_vb(2).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(tx.input.len(), 1, "must spend only the deposit outpoint, never treasury float");
+        assert_eq!(tx.input[0].previous_output, deposit_outpoint);
+        assert_eq!(sent, 99_000);
+        let kept_fee = wallet.change_value(&tx);
+        assert!(kept_fee > 0 && kept_fee < 1_000, "restocking fee change stays in this wallet: {kept_fee}");
+
+        // When send_sat leaves too little for the miner fee, it steps down in 200-sat increments.
+        let small_addr = wallet.fresh_address().unwrap();
+        let small_tx = dummy_funding_tx(vec![(small_addr.script_pubkey(), 1_000)], 33);
+        let small_outpoint = OutPoint {
+            txid: small_tx.compute_txid(),
+            vout: 0,
+        };
+        wallet.confirm_tx_for_test(small_tx, 100, 102);
+        let (stepped_tx, stepped_sent) = wallet
+            .prepare_return_from_deposits(
+                &customer_return,
+                &[small_outpoint],
+                990,
+                FeeRate::from_sat_per_vb(2).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(stepped_tx.input.len(), 1);
+        assert_eq!(stepped_sent, 590);
+        assert_eq!(wallet.change_value(&stepped_tx), 0);
+
+        assert!(
+            wallet
+                .prepare_return_from_deposits(
+                    &customer_return,
+                    &[],
+                    1_000,
+                    FeeRate::from_sat_per_vb(2).unwrap(),
+                )
+                .is_err()
+        );
+
+        drop(wallet);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recover_salvages_wallet_store_after_corrupted_tail() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("wallet-recover-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ChainConfig {
+            network: Network::Bitcoin,
+            backend: Backend::Esplora,
+            esplora_url: "http://127.0.0.1:9".to_string(),
+            electrum_url: String::new(),
+            db_path: dir.join("ecx.db"),
+        };
+        let ext = format!("wpkh({XPRV}/84h/0h/0h/0/*)");
+        let int = format!("wpkh({XPRV}/84h/0h/0h/1/*)");
+
+        let addr = {
+            let mut wallet = ChainWallet::open(&config, &ext, &int).unwrap();
+            let addr = wallet.fresh_address().unwrap();
+            let tx = dummy_funding_tx(vec![(addr.script_pubkey(), 250_000)], 44);
+            wallet.confirm_tx_for_test(tx, 10, 12);
+            addr
+        };
+
+        // Clean store refuses recovery since nothing is corrupt.
+        assert!(ChainWallet::recover(&config, &ext, &int).is_err());
+
+        // Append a truncated/corrupt record to the store tail.
+        {
+            let mut file = OpenOptions::new().append(true).open(&config.db_path).unwrap();
+            file.write_all(&[0xff, 0x00, 0xdeadbeef_u32.to_le_bytes()[0], 0x42]).unwrap();
+        }
+
+        let summary = ChainWallet::recover(&config, &ext, &int).unwrap();
+        assert!(summary.backup_path.exists());
+        assert!(summary.recovered_path.exists());
+        assert_eq!(summary.balance.confirmed, Amount::from_sat(250_000));
+
+        // Swap the recovered store in and verify the wallet opens cleanly with its state intact.
+        std::fs::rename(&summary.recovered_path, &config.db_path).unwrap();
+        let reopened = ChainWallet::open(&config, &ext, &int).unwrap();
+        assert_eq!(reopened.balance().confirmed, Amount::from_sat(250_000));
+        assert!(reopened.owns_address(&addr));
+
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

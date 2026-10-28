@@ -19,9 +19,10 @@
 # no commas or digits. Printed by: cargo run --manifest-path backend/Cargo.toml -- ecx-keygen
 WALLET_MNEMONIC = "ripple marble stove glance orbit velvet canyon hollow lunar ..."
 
-# Optional BIP39 passphrase (the "25th word"). Leave empty unless you set one on purpose and have
-# it backed up. Case matters. The forbidden characters listed above cannot be used in it.
-WALLET_PASSPHRASE = ""
+# Replace (use "" for no passphrase). Optional BIP39 passphrase (the "25th word"). Set to ""
+# unless you chose one on purpose and have it backed up. Case matters. The forbidden characters
+# listed above cannot be used in it.
+WALLET_PASSPHRASE = "optional-bip39-passphrase..."
 
 # Replace. The Solana secret key as one base58 string: 87 or 88 characters, mixed case, no
 # spaces, never the characters 0, O, I, or l. Printed as "secret key (SOLANA_KEYPAIR)" by:
@@ -109,8 +110,8 @@ ECX_ESPLORA_URL = "https://explorer.beta.ecash.ninja/api/"
 # installer refuses that host. The URL is a secret: it contains the key.
 SOLANA_RPC_URL = "https://mainnet.helius-rpc.com/?api-key=replace-this-paid-key"
 # Where the order page's "View on explorer" links point; the transaction id is appended. Leave
-# empty to derive the first from ECX_ESPLORA_URL and use Solscan for the second.
-ECX_EXPLORER_TX_URL = ""
+# as is, or set to "" to derive the first from ECX_ESPLORA_URL.
+ECX_EXPLORER_TX_URL = "https://explorer.beta.ecash.ninja/tx"
 SOLANA_EXPLORER_TX_URL = "https://solscan.io/tx"
 
 # --- Hop 2, required: Surfshark with a Dedicated IP. See deploy/edge/purchase.md. ---
@@ -146,19 +147,25 @@ VPN_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
 # installer checks that the machine's traffic really leaves from this address.
 VPN_PUBLIC_IPV4 = "203.0.113.77"
 
-# --- Hop 1, optional: Mullvad. Leave the six HOP1_WG lines empty to run Surfshark alone. ---
+# --- Hop 1, optional: Mullvad. Set the five HOP1_WG lines below to "" to run Surfshark alone. ---
 # With hop 1, Surfshark never sees the house address: it sees a Mullvad exit, and Mullvad sees
 # the house but not the customer domain. Mullvad takes cash or Monero and needs no email, so it
 # is the hop that should know where the house is. It needs no dedicated address.
-# Fill all six lines from the Mullvad file, or none. Same shapes as the VPN_WG lines above:
-# Address looks like 10.66.123.45/32 (paste the whole line if it also has an IPv6 part), DNS is
-# 10.64.0.1, and Endpoint is an IP address with port 51820, such as 198.51.100.20:51820.
+# Replace these with the lines from the Mullvad file, or set them to "" to skip hop 1. Same
+# shapes as the VPN_WG lines above: Address looks like 10.66.123.45/32 (paste the whole line if
+# it also has an IPv6 part), DNS is 10.64.0.1, and Endpoint is an IP address with port 51820,
+# such as 198.51.100.20:51820.
 HOP1_PROVIDER = "mullvad"
-HOP1_WG_PRIVATE_KEY = ""
-HOP1_WG_ADDRESS = ""
-HOP1_WG_DNS = ""
-HOP1_WG_PEER_PUBLIC_KEY = ""
-HOP1_WG_ENDPOINT = ""
+# Replace, or set to "" to run without hop 1.
+HOP1_WG_PRIVATE_KEY = "mH8rJc2vLp9qWz4xTn6bYf1kSd3gHj5mNp7qR...9vE="
+# Replace, or set to "" to run without hop 1.
+HOP1_WG_ADDRESS = "10.66.123.45/32"
+# Mullvad's WireGuard DNS server. Replace if using another hop 1 provider, or set to "" without hop 1.
+HOP1_WG_DNS = "10.64.0.1"
+# Replace, or set to "" to run without hop 1.
+HOP1_WG_PEER_PUBLIC_KEY = "b9pK3vLmN7qRx2wYz4tC6fGh8jKl0mNpQrStUvWxYzA="
+# Replace, or set to "" to run without hop 1.
+HOP1_WG_ENDPOINT = "198.51.100.20:51820"
 HOP1_WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
 
 # --- Cloudflare. See deploy/edge/cloudflare.md. ---

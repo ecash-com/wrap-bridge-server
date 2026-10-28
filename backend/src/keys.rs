@@ -45,3 +45,52 @@ pub fn load_descriptors() -> Result<WalletDescriptors> {
         internal: internal_descriptor.to_string_with_secret(&int_keymap),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_MNEMONIC: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    #[test]
+    fn derives_bip84_mainnet_descriptors_and_honours_passphrase() {
+        let _guard = crate::config::env_lock();
+        unsafe {
+            std::env::set_var("WALLET_MNEMONIC", TEST_MNEMONIC);
+            std::env::remove_var("WALLET_PASSPHRASE");
+        }
+        let plain = load_descriptors().unwrap();
+        assert!(plain.external.starts_with("wpkh("));
+        assert!(plain.external.contains("/84'/0'/0'/0/*"));
+        assert!(plain.internal.contains("/84'/0'/0'/1/*"));
+        assert_ne!(plain.external, plain.internal);
+
+        unsafe {
+            std::env::set_var("WALLET_PASSPHRASE", "correct-horse-battery-staple");
+        }
+        let with_passphrase = load_descriptors().unwrap();
+        assert_ne!(
+            plain.external, with_passphrase.external,
+            "passphrase must change the derived keys"
+        );
+
+        unsafe {
+            std::env::remove_var("WALLET_PASSPHRASE");
+            std::env::set_var(
+                "WALLET_MNEMONIC",
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            );
+        }
+        assert!(load_descriptors().is_err(), "public fixture mnemonic must be rejected");
+
+        unsafe {
+            std::env::set_var("WALLET_MNEMONIC", "not a valid bip39 mnemonic phrase at all");
+        }
+        assert!(load_descriptors().is_err(), "invalid mnemonic must be rejected");
+
+        unsafe {
+            std::env::remove_var("WALLET_MNEMONIC");
+        }
+    }
+}

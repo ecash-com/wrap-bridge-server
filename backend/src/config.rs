@@ -448,6 +448,35 @@ pub fn solana_rpc_url() -> String {
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string())
 }
 
+/// Removes HTTP(S) URLs from error text before it reaches logs or operator-facing output. RPC
+/// client errors can include credentials embedded in an endpoint's query string or path.
+pub fn redact_urls(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut remaining = text;
+    loop {
+        let next = ["https://", "http://"]
+            .iter()
+            .filter_map(|scheme| remaining.find(scheme).map(|index| (index, scheme.len())))
+            .min_by_key(|(index, _)| *index);
+        let Some((start, _)) = next else {
+            redacted.push_str(remaining);
+            break;
+        };
+
+        redacted.push_str(&remaining[..start]);
+        let url = &remaining[start..];
+        let end = url
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ')' | ']' | '}' | '"' | '\'' | '<' | '>')
+            })
+            .unwrap_or(url.len());
+        redacted.push_str("[redacted URL]");
+        remaining = &url[end..];
+    }
+    redacted
+}
+
 /// Host of an RPC URL, without userinfo, port, or path. `None` when `url` has no scheme.
 pub fn rpc_host(url: &str) -> Option<String> {
     let rest = url
@@ -532,8 +561,28 @@ pub fn wecx_mint() -> Result<solana_sdk::pubkey::Pubkey> {
 }
 
 #[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_text_redacts_urls_without_changing_other_text() {
+        let text = "request https://rpc.example/path?api-key=secret failed (http://localhost:3000)";
+        assert_eq!(
+            redact_urls(text),
+            "request [redacted URL] failed ([redacted URL])"
+        );
+        assert_eq!(
+            redact_urls("<https://a.example/x> 'http://b.example/y' \"https://c.example/z\" [http://d.example] {https://e.example}"),
+            "<[redacted URL]> '[redacted URL]' \"[redacted URL]\" [[redacted URL]] {[redacted URL]}"
+        );
+        assert_eq!(redact_urls("no endpoint in this error"), "no endpoint in this error");
+    }
 
     #[test]
     fn earnings_thresholds_are_exact_and_positive() {
@@ -559,6 +608,7 @@ mod tests {
 
     #[test]
     fn deposit_min_confs_is_clamped_to_at_least_one() {
+        let _guard = env_lock();
         unsafe {
             std::env::set_var("ECX_DEPOSIT_MIN_CONFS", "0");
         }
@@ -566,10 +616,12 @@ mod tests {
         unsafe {
             std::env::remove_var("ECX_DEPOSIT_MIN_CONFS");
         }
+        assert_eq!(deposit_min_confs(), 3);
     }
 
     #[test]
     fn asset_ticker_defaults_and_rejects_malformed_names() {
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("ASSET_TICKER");
         }
@@ -585,10 +637,12 @@ mod tests {
         }
         assert_eq!(asset_ticker(), "aECX");
         assert_eq!(wrapped_ticker(), "waECX");
-        unsafe {
-            std::env::set_var("ASSET_TICKER", "1bad");
+        for bad in ["1bad", "", "bad-name", "bad_name", "TooLongAssetTickerName"] {
+            unsafe {
+                std::env::set_var("ASSET_TICKER", bad);
+            }
+            assert_eq!(asset_ticker(), "bECX", "accepted {bad:?}");
         }
-        assert_eq!(asset_ticker(), "bECX");
         unsafe {
             std::env::remove_var("ASSET_TICKER");
         }
@@ -596,6 +650,7 @@ mod tests {
 
     #[test]
     fn order_lifetime_defaults_to_fifteen_minutes_and_honours_the_old_hours_name() {
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("ORDER_LIFETIME_MINUTES");
             std::env::remove_var("ORDER_MAX_AGE_HOURS");
@@ -621,6 +676,7 @@ mod tests {
 
     #[test]
     fn explorer_tx_url_is_derived_from_the_esplora_api_url() {
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("ECX_EXPLORER_TX_URL");
             std::env::set_var("ECX_ESPLORA_URL", "https://explorer.beta.ecash.ninja/api/");
@@ -657,7 +713,95 @@ mod tests {
     }
 
     #[test]
+    fn sol_stipend_offer_validates_amounts_and_sanitizes_usd_label() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("SOL_STIPEND_LAMPORTS");
+            std::env::remove_var("SOL_STIPEND_PRICE_SAT");
+            std::env::remove_var("SOL_STIPEND_USD_LABEL");
+        }
+        let default = sol_stipend_offer();
+        assert_eq!((default.lamports, default.price_sat, default.usd_label.as_str()), (5_000_000, 500_000, "0.50"));
+
+        // Below 0.001 SOL (1_000_000 lamports) or a zero on either side disables the offer.
+        for (lamports, price) in [("999999", "500000"), ("0", "500000"), ("5000000", "0")] {
+            unsafe {
+                std::env::set_var("SOL_STIPEND_LAMPORTS", lamports);
+                std::env::set_var("SOL_STIPEND_PRICE_SAT", price);
+            }
+            let offer = sol_stipend_offer();
+            assert_eq!((offer.lamports, offer.price_sat), (0, 0), "accepted {lamports}/{price}");
+        }
+
+        unsafe {
+            std::env::remove_var("SOL_STIPEND_LAMPORTS");
+            std::env::remove_var("SOL_STIPEND_PRICE_SAT");
+        }
+        for bad_label in [".50", "0.50.", "1.2.3", "$0.50", "123456789", ""] {
+            unsafe {
+                std::env::set_var("SOL_STIPEND_USD_LABEL", bad_label);
+            }
+            assert_eq!(sol_stipend_offer().usd_label, "", "failed to clear {bad_label:?}");
+        }
+        unsafe {
+            std::env::remove_var("SOL_STIPEND_USD_LABEL");
+        }
+    }
+
+    #[test]
+    fn ecx_payout_fee_rate_handles_fractional_and_invalid_inputs() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("ECX_PAYOUT_FEE_RATE_SAT_VB");
+        }
+        assert_eq!(ecx_payout_fee_rate(), FeeRate::from_sat_per_kwu(500));
+
+        unsafe {
+            std::env::set_var("ECX_PAYOUT_FEE_RATE_SAT_VB", "0.1");
+        }
+        assert_eq!(ecx_payout_fee_rate(), FeeRate::from_sat_per_kwu(25));
+
+        for invalid in ["-1", "NaN", "inf", "not-a-number"] {
+            unsafe {
+                std::env::set_var("ECX_PAYOUT_FEE_RATE_SAT_VB", invalid);
+            }
+            assert_eq!(ecx_payout_fee_rate(), FeeRate::from_sat_per_kwu(500), "accepted {invalid}");
+        }
+        unsafe {
+            std::env::remove_var("ECX_PAYOUT_FEE_RATE_SAT_VB");
+        }
+    }
+
+    #[test]
+    fn treasury_funding_addresses_and_refund_toggle_parse_cleanly() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("TREASURY_FUNDING_ADDRESSES", " addr1 , , addr2 ");
+        }
+        assert_eq!(treasury_funding_addresses(), vec!["addr1".to_string(), "addr2".to_string()]);
+        unsafe {
+            std::env::remove_var("TREASURY_FUNDING_ADDRESSES");
+        }
+        assert!(treasury_funding_addresses().is_empty());
+
+        unsafe {
+            std::env::remove_var("UNMATCHED_DEPOSIT_REFUNDS");
+        }
+        assert!(unmatched_deposit_refunds_enabled());
+        for off in ["0", "false"] {
+            unsafe {
+                std::env::set_var("UNMATCHED_DEPOSIT_REFUNDS", off);
+            }
+            assert!(!unmatched_deposit_refunds_enabled());
+        }
+        unsafe {
+            std::env::remove_var("UNMATCHED_DEPOSIT_REFUNDS");
+        }
+    }
+
+    #[test]
     fn live_payouts_allowed_defaults_false() {
+        let _guard = env_lock();
         // SAFETY-relevant default: an unset/misconfigured env must never silently enable
         // automatic real-money sends.
         unsafe {

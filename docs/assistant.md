@@ -31,7 +31,8 @@ updates are applied by `unattended-upgrades` through the VPN; the status report 
 pending. The assistant can explain that report, not replace it.
 
 For a hard problem, the status report is designed to be safe to paste into any larger model or to
-anyone helping you: it contains no keys, no mnemonic, and no customer addresses. Never paste
+anyone helping you: it contains no keys, no mnemonic, no customer addresses, and redacts URLs in
+recent error lines. The assistant redacts URLs from its own journal excerpt too. Never paste
 `backend.env`, `params.conf`, or a journal excerpt you have not read.
 
 ## How it is kept on the machine

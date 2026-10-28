@@ -43,7 +43,7 @@ If the server was installed offline, connect it now. Then:
 sudo ./install.sh status
 ```
 
-The status report shows the tunnel handshake, the public address the traffic leaves from, the services, balances, orders, recent errors, and pending updates. It contains no keys and no customer addresses, so it can be pasted to anyone helping you. The assistant reads the same report; see [assistant.md](assistant.md).
+The status report shows the tunnel handshake, the public address the traffic leaves from, the services, balances, orders, recent errors, and pending updates. It contains no keys or customer addresses, and URLs in recent error lines are redacted, so it can be pasted to anyone helping you. The assistant reads the same report; see [assistant.md](assistant.md).
 
 Deposit both sides. ECX goes to the `bc1q` address. SOL, for fees, token-account rent, and the optional wrap stipend, and wECX, for customer unwraps, go to the Solana treasury. Send the wECX from `OWNER_SOL_ADDRESS`: a wrapped-token transfer into the treasury from any other wallet, with no order behind it, is treated as a customer's mistake once payouts are on, and sent back minus the fee. Before payouts are on it is only recorded for review, so a first deposit from another wallet is not refunded, but `swap-backend unmatched-deposits` will list it until you leave it be. Then:
 

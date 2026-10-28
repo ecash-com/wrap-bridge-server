@@ -26,7 +26,7 @@ ASSIST="$OPT/assistant"
 MUST_REPLACE_KEYS=(
 	WALLET_MNEMONIC WALLET_PASSPHRASE SOLANA_KEYPAIR OWNER_ECX_ADDRESS OWNER_SOL_ADDRESS
 	VPN_WG_PRIVATE_KEY VPN_WG_ADDRESS VPN_WG_DNS VPN_WG_PEER_PUBLIC_KEY VPN_WG_ENDPOINT VPN_PUBLIC_IPV4
-	HOP1_WG_PRIVATE_KEY HOP1_WG_ADDRESS HOP1_WG_DNS HOP1_WG_PEER_PUBLIC_KEY HOP1_WG_ENDPOINT
+	HOP1_WG_PRIVATE_KEY HOP1_WG_ADDRESS HOP1_WG_PEER_PUBLIC_KEY HOP1_WG_ENDPOINT
 	CLOUDFLARE_TUNNEL_TOKEN CLOUDFLARE_HOSTNAME SOLANA_RPC_URL
 )
 declare -A PARAM_VALUES=() EXAMPLE_VALUES=()
@@ -283,9 +283,9 @@ validate_params() {
 	[[ "${EARNINGS_THRESHOLD_WECX:-100}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "EARNINGS_THRESHOLD_WECX must be a positive amount"
 
 	HOP1_ON=0
-	# The provider label alone does not switch hop 1 on; the sample file names Mullvad there while
-	# leaving the WireGuard lines empty. Any filled WireGuard line does, and then all are required.
-	if [[ -n "${HOP1_WG_PRIVATE_KEY:-}${HOP1_WG_ADDRESS:-}${HOP1_WG_DNS:-}${HOP1_WG_PEER_PUBLIC_KEY:-}${HOP1_WG_ENDPOINT:-}" ]]; then
+	# The provider label and default DNS/AllowedIPs alone do not switch hop 1 on; any filled key,
+	# address, or endpoint line does, and then all five WireGuard lines are required.
+	if [[ -n "${HOP1_WG_PRIVATE_KEY:-}${HOP1_WG_ADDRESS:-}${HOP1_WG_PEER_PUBLIC_KEY:-}${HOP1_WG_ENDPOINT:-}" ]]; then
 		HOP1_ON=1
 		need HOP1_WG_PRIVATE_KEY "${HOP1_WG_PRIVATE_KEY:-}"
 		need HOP1_WG_ADDRESS "${HOP1_WG_ADDRESS:-}"
@@ -806,7 +806,9 @@ cmd_status() {
 	printf '\nRecent backend errors (last 10)\n'
 	journalctl -u ecash-bridge-backend -n 300 --no-pager -o short-iso 2>/dev/null \
 		| grep -iE 'error|failed|denied|unknown outcome|insufficient|mismatch|\[unmatched\]|lost contact|panicked' \
-		| tail -n 10 | sed 's/^/  /' || true
+		| tail -n 10 \
+		| python3 -c 'import re, sys; sys.stdout.write(re.sub(r"https?://[^\s)\]\}>\x22]+", "[redacted URL]", sys.stdin.read()))' \
+		| sed 's/^/  /' || true
 	local tick
 	tick="$(journalctl -u ecash-bridge-backend -n 300 --no-pager -o short-iso 2>/dev/null | grep '\[poll\] tick' | tail -n 1 | cut -d' ' -f1 || true)"
 	[[ -n "$tick" ]] && printf '  last poll tick %s\n' "$tick"

@@ -389,5 +389,30 @@ mod tests {
         assert_eq!(settled.ata_rent_lamports, 0);
         assert_eq!(settled.sol_stipend_lamports, 0);
         assert_eq!(settled.wrap_sat, 203_928 + 400);
+
+        // Deposit at or below the rent price itself cannot cover rent.
+        let exact_rent = settle_wrap_deposit(203_928, 0, 0, 8, 100, 1_000, 500, 2_039_280, 203_928);
+        assert!(exact_rent.ata_rent_uncovered);
+        assert_eq!(exact_rent.ata_rent_lamports, 0);
+
+        // Nonzero rent lamports with a zero price is refused rather than creating the ATA for free.
+        let unpriced_rent = settle_wrap_deposit(100_000_000, 0, 0, 8, 100, 1_000, 500, 2_039_280, 0);
+        assert!(unpriced_rent.ata_rent_uncovered);
+        assert_eq!(unpriced_rent.ata_rent_lamports, 0);
+    }
+
+    #[test]
+    fn minimum_pegin_deposit_scales_across_mint_decimals_and_rejects_full_fee() {
+        // 6-decimal wECX: 1 base unit = 100 sat before fees; with 1% fee, 102 sat after flat fee.
+        let min_6 = minimum_pegin_deposit_sat(500, 6, 100, 1_000);
+        assert_eq!(min_6, 1_102);
+        assert!(pegin_payout_base_units(min_6, 6, 100, 1_000) >= 1);
+        assert_eq!(pegin_payout_base_units(min_6 - 1, 6, 100, 1_000), 0);
+
+        // 9-decimal wECX: 1 sat produces >= 1 base unit.
+        assert_eq!(minimum_pegin_deposit_sat(500, 9, 100, 1_000), 1_001);
+
+        // 100% or higher fee can never produce a positive payout.
+        assert_eq!(minimum_pegin_deposit_sat(500, 8, 10_000, 1_000), u64::MAX);
     }
 }

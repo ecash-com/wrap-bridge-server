@@ -53,4 +53,14 @@ mod tests {
     fn an_unlisted_value_is_allowed() {
         reject_if_public_fixture("WALLET_MNEMONIC", "legal winner thank year wave sausage worth useful legal winner thank yellow").unwrap();
     }
+
+    #[test]
+    fn surrounding_whitespace_does_not_bypass_rejection() {
+        let err = reject_if_public_fixture(
+            "WALLET_MNEMONIC",
+            "  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about \n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("committed to git"));
+    }
 }
